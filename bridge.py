@@ -35,6 +35,7 @@ DEFAULT_PROFILE_DIR = os.path.join(APPDATA_ROOT, "antigravity-cli")
 PROFILES_DIR = os.environ.get("AGY_PROFILES_DIR", "/root/.agy-profiles")
 WORKDIR = os.environ.get("AGY_CWD", "/root/agy-bridge/work")
 TURN_TIMEOUT = int(os.environ.get("AGY_TURN_TIMEOUT", "300"))
+LOCK_WAIT = int(os.environ.get("AGY_LOCK_WAIT", "20"))
 WORKERS_PER_PROFILE = max(1, int(os.environ.get("AGY_WORKERS_PER_PROFILE", "1")))
 TOKEN_FILE = "antigravity-oauth-token"
 
@@ -145,6 +146,7 @@ class AgyWorker:
         self.profile = profile
         self.idx = idx
         self.lock = threading.RLock()
+        self.busy = False              # RLock has no .locked(); track it explicitly
         self.id_q = {}
         self.turn_q = {}
         self.next_id = 100
@@ -247,9 +249,17 @@ class AgyWorker:
                 raise RuntimeError(f"{method}: {msg['error'].get('message')}")
             return msg.get("result", {})
 
-    def chat(self, text, model=None, timeout=None):
+    def chat(self, text, model=None, timeout=None, lock_wait=None):
         timeout = timeout or TURN_TIMEOUT
-        with self.lock:
+        # A generator holds this lock for the whole turn. If a client disconnects
+        # mid-stream the generator must be closed by the caller, otherwise the
+        # lock leaks and every later request queues until it times out. Wait a
+        # bounded time so a busy worker fails over instead of hanging.
+        lock_wait = LOCK_WAIT if lock_wait is None else lock_wait
+        if not self.lock.acquire(timeout=lock_wait):
+            raise RuntimeError(f"worker busy ({self.profile})")
+        self.busy = True
+        try:
             sid = None
             try:
                 new = self.rpc("session/new", {"cwd": WORKDIR, "mcpServers": []}, timeout=60)
@@ -295,6 +305,9 @@ class AgyWorker:
             finally:
                 if sid:
                     self.turn_q.pop(sid, None)
+        finally:
+            self.busy = False
+            self.lock.release()
 
 
 # ---------------------------------------------------------------- pool
@@ -433,54 +446,64 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
             if not ws:
                 errors.append(f"{name}: no live worker")
                 continue
-            worker = ws[0]
+            worker = next((w for w in ws if not w.busy), ws[0])
             if state is not None:
                 state["profile"] = name
                 state["fallback"] = bool(errors)
             gen = worker.chat(prompt, model=model, timeout=timeout)
-            buf = ""
-            settled = False
-            for piece in gen:
-                if not isinstance(piece, str):
-                    break
-                if settled:
-                    yield piece
-                    continue
-                buf += piece
-                low = buf.lower()
-                if len(buf) >= 160:
-                    settled = True
-                elif any(b in low for b in BANNER_VERIFY):
-                    settled = True
-                elif BANNER_TOS in low:
-                    settled = True
-                if settled and BANNER_TOS in low:
-                    POOL.mark(name, "tos", buf.strip()[:160])
-                    raise RuntimeError("tos banner")
-                if settled and any(b in low for b in BANNER_VERIFY):
-                    POOL.mark(name, "verify", buf.strip()[:160])
-                    raise RuntimeError("verify banner")
-                if settled:
-                    yield buf
-            if buf and not settled:
-                low = buf.lower()
-                if BANNER_TOS in low:
-                    POOL.mark(name, "tos", buf.strip()[:160])
-                    raise RuntimeError("tos banner")
-                if any(b in low for b in BANNER_VERIFY):
-                    POOL.mark(name, "verify", buf.strip()[:160])
-                    raise RuntimeError("verify banner")
-                yield buf
-            return
+            try:
+                yield from _drain(gen, name)
+                return
+            finally:
+                # closing the generator runs its finally block and releases the
+                # worker lock even when the caller stops iterating (client gone)
+                gen.close()
         except Exception as e:
             msg = str(e)
             low = msg.lower()
             if "tos banner" not in low and "verify banner" not in low:
                 log(f"[{name}] turn failed, falling back: {msg[:160]}")
-                if "429" in msg or "quota" in low or "rate" in low:
-                    POOL.cooldown(name, 300, msg)
+                if "429" in msg or "quota" in low or "rate" in low or "busy" in low:
+                    POOL.cooldown(name, 60 if "busy" in low else 300, msg)
             errors.append(f"{name}: {msg[:120]}")
     raise RuntimeError("all profiles failed — " + "; ".join(errors))
+
+
+def _drain(gen, name):
+    """Buffer the head of a turn, reject ban banners, then stream the rest."""
+    buf = ""
+    settled = False
+    for piece in gen:
+        if not isinstance(piece, str):
+            break
+        if settled:
+            yield piece
+            continue
+        buf += piece
+        low = buf.lower()
+        if len(buf) >= 160:
+            settled = True
+        elif any(b in low for b in BANNER_VERIFY):
+            settled = True
+        elif BANNER_TOS in low:
+            settled = True
+        if settled and BANNER_TOS in low:
+            POOL.mark(name, "tos", buf.strip()[:160])
+            raise RuntimeError("tos banner")
+        if settled and any(b in low for b in BANNER_VERIFY):
+            POOL.mark(name, "verify", buf.strip()[:160])
+            raise RuntimeError("verify banner")
+        if settled:
+            yield buf
+    if buf and not settled:
+        low = buf.lower()
+        if BANNER_TOS in low:
+            POOL.mark(name, "tos", buf.strip()[:160])
+            raise RuntimeError("tos banner")
+        if any(b in low for b in BANNER_VERIFY):
+            POOL.mark(name, "verify", buf.strip()[:160])
+            raise RuntimeError("verify banner")
+        yield buf
 
 
 # ---------------------------------------------------------------- helpers
@@ -724,6 +747,7 @@ class Handler(BaseHTTPRequestHandler):
         model = raw_model or None
         prof = prefer or "?"
         state = {}
+        gen = None
         try:
             gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state)
             if not stream:
@@ -764,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            log("client disconnected mid-turn")
         except Exception as e:
             log(f"turn error: {e}")
             try:
@@ -774,6 +798,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 else:
                     self._json(500, {"error": {"message": str(e)}})
+            except Exception:
+                pass
+        finally:
+            # releasing the generator releases the worker lock; without this a
+            # dropped client leaves the worker locked and later turns time out
+            try:
+                if gen is not None:
+                    gen.close()
             except Exception:
                 pass
 
