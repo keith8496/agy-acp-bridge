@@ -205,7 +205,34 @@ agy-bridge.service         systemd unit
 scripts/
   classify_all.py          real-turn liveness for every profile + verification links
   get_validation_url.py    pull one profile's VALIDATION_REQUIRED link
+  latency_test.py          three turns of one conversation, per-turn timing
+  long_convo_test.py       shows sent bytes vs growing client history
+  bridge_memory_test.py    cache must not lose context (plant a fact, ask again)
+  acp_bench.py             raw `agy acp` bench: fresh session vs one continued
+  session_memory_check.py  does a continued ACP session really remember
+  tools_test.py            function calling through the bridge
+  vision_test.py           image round-trip through the bridge
+  parallel_test.py         four concurrent turns
+  disconnect_test.py       dropped client must not leak the worker lock
+  audit_compare.py         behaviour + latency vs a normal OpenAI provider
 ```
+
+## Latency: live session reuse
+
+A request that continues a conversation reuses the ACP session that already
+holds its context, so only the new tail of the history is transmitted. Sessions
+are keyed on model + message-hash chain (a branch or an edited history misses
+and creates a fresh session), closed when idle or beyond `AGY_SESSION_MAX`, and
+a turn whose upstream stream produces no event for `AGY_STALL_TIMEOUT` seconds
+is cancelled instead of holding the worker for the full turn timeout.
+
+Knobs: `AGY_SESSION_CACHE=0` disables reuse, `AGY_SESSION_IDLE` (seconds),
+`AGY_SESSION_MAX` (per worker), `AGY_PREWARM=0` disables boot pre-warm,
+`AGY_PREWARM_PROFILES`, `AGY_STALL_TIMEOUT` (seconds).
+
+`GET /health` reports `cache: {hit, miss, closed, sessions}`. Each turn logs
+`turn cache=hit|miss sent=NB new=Xms total=Ys`; `sent` is the prompt size
+actually transmitted, so a hit is visible as a small constant.
 
 ## License
 

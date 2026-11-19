@@ -18,6 +18,7 @@ Endpoints
   POST /v1/chat/completions       stream + non-stream (model "profile/model" pins)
 """
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -38,7 +39,18 @@ PROFILES_DIR = os.environ.get("AGY_PROFILES_DIR", "/root/.agy-profiles")
 WORKDIR = os.environ.get("AGY_CWD", "/root/agy-bridge/work")
 TURN_TIMEOUT = int(os.environ.get("AGY_TURN_TIMEOUT", "300"))
 LOCK_WAIT = int(os.environ.get("AGY_LOCK_WAIT", "20"))
+# A turn that produces NO event for this long is wedged upstream: cancel
+# it and fail over instead of holding the worker until TURN_TIMEOUT.
+STALL_TIMEOUT = int(os.environ.get("AGY_STALL_TIMEOUT", "120"))
 WORKERS_PER_PROFILE = max(1, int(os.environ.get("AGY_WORKERS_PER_PROFILE", "1")))
+# Session cache: a request that extends a conversation we already
+# have in a live ACP session only sends the new tail.
+SESSION_CACHE = os.environ.get("AGY_SESSION_CACHE", "1") != "0"
+SESSION_IDLE = int(os.environ.get("AGY_SESSION_IDLE", "900"))
+SESSION_MAX = max(1, int(os.environ.get("AGY_SESSION_MAX", "4")))
+# Spawn the primary profile at boot instead of on the first request.
+PREWARM = os.environ.get("AGY_PREWARM", "1") != "0"
+PREWARM_PROFILES = max(0, int(os.environ.get("AGY_PREWARM_PROFILES", "1")))
 TOKEN_FILE = "antigravity-oauth-token"
 
 os.makedirs(WORKDIR, exist_ok=True)
@@ -143,12 +155,43 @@ LOGINS = {}
 
 
 # ---------------------------------------------------------------- ACP worker
+def message_hash(m):
+    """Stable fingerprint of one chat message for the session cache.
+
+    Images are hashed by their URL/base64 digest, not embedded raw:
+    the same picture in two requests must line up without carrying
+    megabytes of base64 around.
+    """
+    role = str(m.get("role") or "user")
+    c = m.get("content")
+    if isinstance(c, list):
+        parts = []
+        for p in c:
+            if not isinstance(p, dict):
+                continue
+            t = p.get("type")
+            if t == "text":
+                parts.append("t:" + str(p.get("text") or ""))
+            elif t in ("image_url", "image", "input_image"):
+                iu = p.get("image_url") or p.get("imageUrl") or {}
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                parts.append("i:" + hashlib.sha1(
+                    str(url).encode("utf-8", "replace")).hexdigest())
+            else:
+                parts.append(str(t) + ":" + json.dumps(p, sort_keys=True)[:200])
+        c = "\n".join(parts)
+    return hashlib.sha1((role + "\x00" + str(c or "")).encode(
+        "utf-8", "replace")).hexdigest()
+
+
 class AgyWorker:
     def __init__(self, profile, idx):
         self.profile = profile
         self.idx = idx
         self.lock = threading.RLock()
         self.busy = False              # RLock has no .locked(); track it explicitly
+        self.sessions = {}             # (model, history hashes) -> live session
+        self.stats = {"hit": 0, "miss": 0, "closed": 0}
         self.id_q = {}
         self.turn_q = {}
         self.next_id = 100
@@ -176,6 +219,68 @@ class AgyWorker:
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
+
+    # ---- ACP session cache ------------------------------------------------
+    # Every request used to pay session/new + set_model + the WHOLE transcript
+    # as one prompt. A live ACP session already holds its context, so a request
+    # whose history extends one we have only needs the new tail. Key = model +
+    # hash of every message sent so far; a hit requires the stored hashes to be
+    # a strict prefix of the incoming ones (a branch or an edit misses).
+
+    def _find_session(self, hashes, model):
+        for key, e in list(self.sessions.items()):
+            if e["model"] != model:
+                continue
+            h = e["hashes"]
+            if h and len(hashes) > len(h) and hashes[:len(h)] == h:
+                return key, len(h)
+        return None, 0
+
+    def _drop_session(self, key, reason=""):
+        e = self.sessions.pop(key, None)
+        if not e:
+            return
+        try:
+            self.rpc("session/close", {"sessionId": e["sid"]}, 5)
+            self.stats["closed"] += 1
+        except Exception as ex:
+            log(f"[{self.profile}] session/close {e['sid'][:8]}: {str(ex)[:80]}")
+        if reason:
+            log(f"[{self.profile}] session {e['sid'][:8]} dropped ({reason})")
+
+    def _drop_session_by_sid(self, sid, reason="turn unfinished"):
+        for k, e in list(self.sessions.items()):
+            if e["sid"] == sid:
+                self._drop_session(k, reason)
+                return
+        try:
+            self.rpc("session/close", {"sessionId": sid}, 5)
+        except Exception:
+            pass
+
+    def _cleanup_sessions(self):
+        now = time.time()
+        for k, e in list(self.sessions.items()):
+            if now - e["last"] > SESSION_IDLE:
+                self._drop_session(k, "idle")
+        while len(self.sessions) > SESSION_MAX:
+            oldest = min(self.sessions.items(), key=lambda kv: kv[1]["last"])[0]
+            self._drop_session(oldest, "lru")
+
+    def warm(self):
+        """Pay the one-time first-session cost before a real request lands."""
+        if not self.lock.acquire(timeout=30):
+            return
+        try:
+            sid = self.rpc("session/new", {"cwd": WORKDIR, "mcpServers": []},
+                           90).get("sessionId")
+            if sid:
+                try:
+                    self.rpc("session/close", {"sessionId": sid}, 10)
+                except Exception:
+                    pass
+        finally:
+            self.lock.release()
 
     def _read_stderr(self):
         for line in self.proc.stderr:
@@ -251,7 +356,8 @@ class AgyWorker:
                 raise RuntimeError(f"{method}: {msg['error'].get('message')}")
             return msg.get("result", {})
 
-    def chat(self, text, model=None, timeout=None, lock_wait=None, images=None):
+    def chat(self, text, model=None, timeout=None, lock_wait=None, images=None,
+             segments=None, suffix=""):
         timeout = timeout or TURN_TIMEOUT
         # A generator holds this lock for the whole turn. If a client disconnects
         # mid-stream the generator must be closed by the caller, otherwise the
@@ -261,18 +367,53 @@ class AgyWorker:
         if not self.lock.acquire(timeout=lock_wait):
             raise RuntimeError(f"worker busy ({self.profile})")
         self.busy = True
+        t_start = time.time()
+        sid = None
+        sess_key = None
+        hashes = None
+        reused = False
+        finished = False
+        t_new = 0.0
+        prompt_text = text
         try:
-            sid = None
             try:
-                new = self.rpc("session/new", {"cwd": WORKDIR, "mcpServers": []}, timeout=60)
-                sid = new.get("sessionId")
-                if not sid:
-                    raise RuntimeError("no sessionId")
-                if model:
-                    try:
-                        self.rpc("session/set_model", {"sessionId": sid, "modelId": model}, 30)
-                    except Exception as e:
-                        log(f"[{self.profile}] set_model {model}: {e}")
+                self._cleanup_sessions()
+                if segments is not None and SESSION_CACHE:
+                    hashes = tuple(message_hash(m) for m in segments)
+                    sess_key, cut = self._find_session(hashes, model or "")
+                    if sess_key is not None:
+                        sid = self.sessions[sess_key]["sid"]
+                        self.sessions[sess_key]["last"] = time.time()
+                        reused = True
+                        self.stats["hit"] += 1
+                        prompt_text, images = flatten(segments[cut:])
+                    else:
+                        prompt_text, images = flatten(segments)
+                        self.stats["miss"] += 1
+                if suffix:
+                    prompt_text += suffix
+                if sid is None:
+                    t0 = time.time()
+                    new = self.rpc("session/new", {"cwd": WORKDIR, "mcpServers": []}, timeout=60)
+                    sid = new.get("sessionId")
+                    t_new = time.time() - t0
+                    if not sid:
+                        raise RuntimeError("no sessionId")
+                    if model:
+                        try:
+                            self.rpc("session/set_model", {"sessionId": sid, "modelId": model}, 30)
+                        except Exception as e:
+                            log(f"[{self.profile}] set_model {model}: {e}")
+                    if hashes is not None:
+                        sess_key = (model or "", hashes)
+                        # same history replayed (e.g. a retry or a fresh client
+                        # asking the identical first question): the old session
+                        # cannot be extended, so close it instead of leaking it
+                        if sess_key in self.sessions:
+                            self._drop_session(sess_key, "superseded")
+                        self.sessions[sess_key] = {"sid": sid, "model": model or "",
+                                                   "hashes": hashes, "last": time.time()}
+                        self._cleanup_sessions()
                 q = queue.Queue()
                 self.turn_q[sid] = q
                 seen = {}
@@ -282,10 +423,11 @@ class AgyWorker:
                 mid = self.next_id
                 self.next_id += 1
                 self.id_q[mid] = q
-                blocks = [{"type": "text", "text": text}] + list(images or [])
+                blocks = [{"type": "text", "text": prompt_text}] + list(images or [])
                 self._send({"jsonrpc": "2.0", "id": mid, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": blocks}})
                 deadline = time.time() + timeout
+                last_evt = time.time()
                 while True:
                     left = deadline - time.time()
                     if left <= 0:
@@ -295,7 +437,17 @@ class AgyWorker:
                     try:
                         kind, msg = q.get(timeout=min(left, 1.0))
                     except queue.Empty:
+                        if time.time() - last_evt > STALL_TIMEOUT:
+                            # the upstream stream went silent mid-turn; cancel is
+                            # advisory, dropping the session in finally is what
+                            # actually frees the agent
+                            log(f"[{self.profile}] turn stalled "
+                                f"{time.time() - last_evt:.0f}s, cancelling {sid[:8]}")
+                            self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                                        "params": {"sessionId": sid}})
+                            raise TimeoutError(f"turn stalled (no event {STALL_TIMEOUT}s)")
                         continue
+                    last_evt = time.time()
                     if kind == "update":
                         u = msg
                         kind_name = u.get("sessionUpdate") or "?"
@@ -327,6 +479,18 @@ class AgyWorker:
                     if kind == "response":
                         if "error" in msg:
                             raise RuntimeError(msg["error"].get("message"))
+                        # the turn is complete: keep the session and rekey it on
+                        # the full incoming history BEFORE any yield, so a client
+                        # that stops reading at tool_calls does not orphan it
+                        finished = True
+                        if hashes is not None and sess_key in self.sessions:
+                            entry = self.sessions.pop(sess_key)
+                            entry["hashes"] = hashes
+                            entry["last"] = time.time()
+                            self.sessions[(model or "", hashes)] = entry
+                        log(f"[{self.profile}] turn cache="
+                            f"{'hit' if reused else 'miss'} sent={len(prompt_text)}B "
+                            f"new={t_new * 1000:.0f}ms total={time.time() - t_start:.2f}s")
                         if not emitted:
                             usable = [t for t in tools_out.values()
                                       if t["function"]["name"]]
@@ -343,6 +507,8 @@ class AgyWorker:
             finally:
                 if sid:
                     self.turn_q.pop(sid, None)
+                    if not finished or hashes is None:
+                        self._drop_session_by_sid(sid)
         finally:
             self.busy = False
             self.lock.release()
@@ -466,7 +632,8 @@ BANNER_TOS = "terms of service"
 BANNER_VERIFY = ("verification required", "verify your account")
 
 
-def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None, images=None):
+def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None, images=None,
+                       segments=None, suffix=""):
     """Yield text pieces for one turn, walking the profile list as a fallback
     chain. The primary carries the traffic; the next profile is only touched
     when the primary fails *before* delivering usable text.
@@ -488,7 +655,8 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
             if state is not None:
                 state["profile"] = name
                 state["fallback"] = bool(errors)
-            gen = worker.chat(prompt, model=model, timeout=timeout, images=images)
+            gen = worker.chat(prompt, model=model, timeout=timeout, images=images,
+                              segments=segments, suffix=suffix)
             try:
                 yield from _drain(gen, name)
                 return
@@ -828,9 +996,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b)
             return
         if self.path.startswith("/health"):
-            return self._json(200, {"ok": True, "profiles": list_profiles(),
-                                    "workers": {k: [w.alive() for w in v]
-                                                for k, v in POOL.workers.items()}})
+            return self._json(200, {
+                "ok": True, "profiles": list_profiles(),
+                "workers": {k: [w.alive() for w in v] for k, v in POOL.workers.items()},
+                "cache": {k: dict(w.stats, sessions=len(w.sessions)) for k, ws in POOL.workers.items()
+                          for w in ws[:1]}})
         if self.path.startswith("/v1/models"):
             return self._json(200, {"object": "list", "data": [
                 {"id": m, "object": "model", "owned_by": "antigravity"} for m in models_for()]})
@@ -902,12 +1072,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat(self):
         body = self._body()
-        prompt, images = flatten(body.get("messages") or [])
+        messages = body.get("messages") or []
+        prompt, images = flatten(messages)
         tools = body.get("tools") or []
         max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         stop = body.get("stop")
-        if tools:
-            prompt += tools_prompt(tools)
+        tools_text = tools_prompt(tools) if tools else ""
+        if tools_text:
+            prompt += tools_text
         raw_model = (body.get("model") or "").strip()
         prefer = None
         if "/" in raw_model:
@@ -921,7 +1093,7 @@ class Handler(BaseHTTPRequestHandler):
         gen = None
         try:
             gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state,
-                                     images=images)
+                                     images=images, segments=messages, suffix=tools_text)
             if not stream:
                 parts, tcalls = [], []
                 for piece in gen:
@@ -1035,11 +1207,36 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
+def prewarm():
+    """Spawn the primary profile's workers before the first real request.
+
+    The first session/new inside a fresh agy process costs ~1.5s because the
+    CLI creates its workspace; later ones are ~40ms. Paying that at boot turns
+    the first user request into a normal-latency one.
+    """
+    try:
+        names = POOL.order()
+    except Exception as e:
+        log(f"[prewarm] skipped: {e}")
+        return
+    for name in names[:PREWARM_PROFILES]:
+        t0 = time.time()
+        try:
+            ws = [w for w in POOL.ensure(name) if w.alive()]
+            for w in ws:
+                w.warm()
+            log(f"[prewarm] {name}: {len(ws)} worker(s) ready in {time.time() - t0:.2f}s")
+        except Exception as e:
+            log(f"[prewarm] {name}: {str(e)[:120]}")
+
+
 def main():
     log(f"agy-acp-bridge v2 on 127.0.0.1:{PORT}, profiles={list_profiles()}")
     bind = os.environ.get("AGY_BRIDGE_BIND", "127.0.0.1")
     srv = ThreadingHTTPServer((bind, PORT), Handler)
     srv.daemon_threads = True
+    if PREWARM:
+        threading.Thread(target=prewarm, daemon=True).start()
     log("listening")
     srv.serve_forever()
 
