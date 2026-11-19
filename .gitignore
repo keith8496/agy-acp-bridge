@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+profile-state.json
+liveness.json
+work/
+*.log
+.env

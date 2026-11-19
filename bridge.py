@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""
+agy-acp-bridge v2 — OpenAI-compatible surface over the official Antigravity CLI.
+
+Adds account profiles: every account lives in its own `--app-data-dir`, so
+several Google accounts hold credentials side by side and the bridge rotates
+across the ones that pass a real turn.
+
+Endpoints
+  GET  /admin                     web UI: add account, paste code, test turn
+  POST /admin/login/start         {profile}         -> {loginId, url}
+  POST /admin/login/complete      {loginId, code}   -> {ok, detail}
+  GET  /admin/login/<id>          login progress (url, done, detail)
+  GET  /admin/profiles            profiles + test state
+  POST /admin/test                {profile, model}  -> one real turn
+  GET  /health
+  GET  /v1/models
+  POST /v1/chat/completions       stream + non-stream (model "profile/model" pins)
+"""
+import json
+import os
+import queue
+import subprocess
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+AGY = os.environ.get("AGY_BIN", "/root/.local/bin/agy")
+PORT = int(os.environ.get("AGY_BRIDGE_PORT", "20130"))
+# --app-data-dir rejects absolute paths ("must not be absolute"): it is a
+# directory NAME resolved under ~/.gemini. So each profile is a name, not a path.
+APPDATA_ROOT = os.environ.get("AGY_APPDATA_ROOT", "/root/.gemini")
+DEFAULT_PROFILE_DIR = os.path.join(APPDATA_ROOT, "antigravity-cli")
+PROFILES_DIR = os.environ.get("AGY_PROFILES_DIR", "/root/.agy-profiles")
+WORKDIR = os.environ.get("AGY_CWD", "/root/agy-bridge/work")
+TURN_TIMEOUT = int(os.environ.get("AGY_TURN_TIMEOUT", "300"))
+WORKERS_PER_PROFILE = max(1, int(os.environ.get("AGY_WORKERS_PER_PROFILE", "1")))
+TOKEN_FILE = "antigravity-oauth-token"
+
+os.makedirs(WORKDIR, exist_ok=True)
+os.makedirs(PROFILES_DIR, exist_ok=True)
+
+_lock = threading.Lock()
+
+
+def log(*a):
+    with _lock:
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ---------------------------------------------------------------- profiles
+def profile_name(name):
+    """Value to pass to --app-data-dir: a bare directory name, never a path."""
+    if name in ("default", "", None):
+        return "antigravity-cli"
+    return "agy-" + name
+
+
+def profile_dir(name):
+    """Absolute on-disk location of that profile's data."""
+    if name in ("default", "", None):
+        return DEFAULT_PROFILE_DIR
+    return os.path.join(APPDATA_ROOT, profile_name(name))
+
+
+def profile_authed(name):
+    return os.path.isfile(os.path.join(profile_dir(name), TOKEN_FILE))
+
+
+def list_profiles():
+    out = []
+    if profile_authed("default"):
+        out.append("default")
+    if os.path.isdir(APPDATA_ROOT):
+        for entry in sorted(os.listdir(APPDATA_ROOT)):
+            if not entry.startswith("agy-"):
+                continue
+            p = os.path.join(APPDATA_ROOT, entry)
+            if os.path.isdir(p) and os.path.isfile(os.path.join(p, TOKEN_FILE)):
+                out.append(entry[4:])
+    if os.path.isdir(PROFILES_DIR):  # legacy absolute-path profiles
+        for entry in sorted(os.listdir(PROFILES_DIR)):
+            p = os.path.join(PROFILES_DIR, entry)
+            if os.path.isdir(p) and os.path.isfile(os.path.join(p, TOKEN_FILE)) and entry not in out:
+                out.append("__legacy__" + entry)
+    return out
+
+
+# ---------------------------------------------------------------- login flow
+class Login:
+    def __init__(self, profile):
+        self.id = uuid.uuid4().hex[:12]
+        self.profile = profile
+        args = [AGY, "acp", "--login"]
+        if profile != "default":
+            args += ["--app-data-dir", profile_name(profile)]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb",
+                 "HOME": os.environ.get("HOME", "/root")},
+        )
+        self.url = None
+        self.done = False
+        self.ok = None
+        self.detail = ""
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = ""
+        for line in self.proc.stdout:
+            line = line.rstrip()
+            buf += line + "\n"
+            if not self.url:
+                i = buf.find("https://accounts.google.com/")
+                if i >= 0:
+                    j = buf.find("\n", i)
+                    self.url = buf[i:j if j > 0 else len(buf)].strip()
+            low = line.lower()
+            if "logged in as" in low:
+                self.ok, self.detail, self.done = True, line, True
+            elif "couldn't log in" in low:
+                self.ok, self.detail, self.done = False, line, True
+        self.proc.wait()
+        if not self.done:
+            self.done = True
+            self.ok = self.ok or False
+            self.detail = self.detail or f"exited {self.proc.returncode}"
+
+    def submit(self, code):
+        if self.proc.poll() is not None:
+            return False
+        self.proc.stdin.write(code.strip() + "\n")
+        self.proc.stdin.flush()
+        return True
+
+
+LOGINS = {}
+
+
+# ---------------------------------------------------------------- ACP worker
+class AgyWorker:
+    def __init__(self, profile, idx):
+        self.profile = profile
+        self.idx = idx
+        self.lock = threading.RLock()
+        self.id_q = {}
+        self.turn_q = {}
+        self.next_id = 100
+        self._spawn()
+
+    def _spawn(self):
+        args = [AGY, "acp", "--sandbox"]
+        if self.profile != "default":
+            args += ["--app-data-dir", profile_name(self.profile)]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=WORKDIR, text=True, bufsize=1,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb",
+                 "HOME": os.environ.get("HOME", "/root")},
+        )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.rpc("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
+                                   "terminal": False},
+            "clientInfo": {"name": "agy-acp-bridge", "version": "2.0.0"},
+        }, timeout=60)
+        log(f"[{self.profile}] acp ready")
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _read_stderr(self):
+        for line in self.proc.stderr:
+            line = line.rstrip()
+            if line and not line.startswith(("I0", "W0", "E0")):
+                pass
+
+    def _read_stdout(self):
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self._dispatch(json.loads(line))
+            except Exception as e:
+                log(f"[{self.profile} dispatch] {e}")
+
+    def _dispatch(self, msg):
+        method = msg.get("method")
+        if method:
+            if method == "session/update":
+                p = msg.get("params", {})
+                q = self.turn_q.get(p.get("sessionId"))
+                if q:
+                    q.put(("update", p.get("update", {})))
+                return
+            if method == "session/request_permission":
+                opts = msg.get("params", {}).get("options", []) or []
+                reject = next((o.get("optionId") for o in opts
+                               if str(o.get("kind", "")).startswith("reject")), None)
+                self._send({"jsonrpc": "2.0", "id": msg.get("id"),
+                            "result": ({"outcome": {"outcome": "selected", "optionId": reject}}
+                                       if reject else {"outcome": {"outcome": "cancelled"}})})
+                return
+            if "id" in msg:
+                self._send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}})
+            return
+        if "id" in msg:
+            q = self.id_q.pop(msg["id"], None)
+            if q is None:
+                for tq in list(self.turn_q.values()):
+                    q = tq
+                    break
+            if q:
+                q.put(("response", msg))
+
+    def _send(self, obj):
+        if not self.alive():
+            raise RuntimeError("agy acp exited")
+        self.proc.stdin.write(json.dumps(obj) + "\n")
+        self.proc.stdin.flush()
+
+    def rpc(self, method, params, timeout=120):
+        mid = self.next_id
+        self.next_id += 1
+        q = queue.Queue()
+        self.id_q[mid] = q
+        self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                self.id_q.pop(mid, None)
+                raise TimeoutError(f"{method} timeout")
+            try:
+                kind, msg = q.get(timeout=left)
+            except queue.Empty:
+                self.id_q.pop(mid, None)
+                raise TimeoutError(f"{method} timeout")
+            if kind != "response":
+                continue
+            if "error" in msg:
+                raise RuntimeError(f"{method}: {msg['error'].get('message')}")
+            return msg.get("result", {})
+
+    def chat(self, text, model=None, timeout=None):
+        timeout = timeout or TURN_TIMEOUT
+        with self.lock:
+            sid = None
+            try:
+                new = self.rpc("session/new", {"cwd": WORKDIR, "mcpServers": []}, timeout=60)
+                sid = new.get("sessionId")
+                if not sid:
+                    raise RuntimeError("no sessionId")
+                if model:
+                    try:
+                        self.rpc("session/set_model", {"sessionId": sid, "modelId": model}, 30)
+                    except Exception as e:
+                        log(f"[{self.profile}] set_model {model}: {e}")
+                q = queue.Queue()
+                self.turn_q[sid] = q
+                mid = self.next_id
+                self.next_id += 1
+                self.id_q[mid] = q
+                self._send({"jsonrpc": "2.0", "id": mid, "method": "session/prompt",
+                            "params": {"sessionId": sid,
+                                       "prompt": [{"type": "text", "text": text}]}})
+                deadline = time.time() + timeout
+                while True:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                                    "params": {"sessionId": sid}})
+                        raise TimeoutError("turn timeout")
+                    try:
+                        kind, msg = q.get(timeout=min(left, 1.0))
+                    except queue.Empty:
+                        continue
+                    if kind == "update":
+                        u = msg
+                        if u.get("sessionUpdate") == "agent_message_chunk":
+                            c = u.get("content") or {}
+                            if c.get("type") == "text" and c.get("text"):
+                                yield c["text"]
+                        continue
+                    if kind == "response":
+                        if "error" in msg:
+                            raise RuntimeError(msg["error"].get("message"))
+                        yield {"__done__": True}
+                        return
+            finally:
+                if sid:
+                    self.turn_q.pop(sid, None)
+
+
+# ---------------------------------------------------------------- pool
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile-state.json")
+
+
+class ProfilePool:
+    def __init__(self):
+        self.workers = {}
+        self.tested = {}
+        self.rr = 0
+        self.lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(STATE_FILE) as f:
+                self.tested = json.load(f) or {}
+        except Exception:
+            self.tested = {}
+
+    def _save(self):
+        try:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.tested, f, indent=2)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            log(f"state save: {e}")
+
+    def set_primary(self, profile):
+        self.tested.setdefault("_primary", {})["profile"] = profile
+        self._save()
+
+    def mark(self, profile, status, detail=""):
+        if profile == "_primary":
+            return
+        self.tested[profile] = {"status": status, "detail": detail[:200],
+                                "at": time.time()}
+        self._save()
+
+    def cooldown(self, profile, seconds, reason=""):
+        """Park a profile for a while after a transient failure (429, timeout)."""
+        if profile == "_primary":
+            return
+        self.tested.setdefault(profile, {})["cooldown_until"] = time.time() + seconds
+        self.tested[profile]["cooldown_reason"] = reason[:160]
+        self._save()
+
+    def ensure(self, profile):
+        with self.lock:
+            ws = self.workers.get(profile)
+            if ws and all(w.alive() for w in ws):
+                return ws
+            ws = []
+            for i in range(WORKERS_PER_PROFILE):
+                try:
+                    ws.append(AgyWorker(profile, i))
+                except Exception as e:
+                    log(f"[{profile}] worker spawn failed: {e}")
+            self.workers[profile] = ws
+            return ws
+
+    # ---- ordering: one primary, the rest are fallback -------------------
+    def primary(self):
+        forced = os.environ.get("AGY_PRIMARY_PROFILE", "").strip()
+        if forced and forced in list_profiles():
+            return forced
+        saved = (self.tested.get("_primary") or {}).get("profile")
+        if saved and saved in list_profiles() and \
+                self.tested.get(saved, {}).get("status") not in ("tos", "verify"):
+            return saved
+        for p, st in self.tested.items():
+            if p != "_primary" and st.get("status") == "ok":
+                return p
+        return None
+
+    def order(self, prefer=None):
+        """Every usable profile, primary first. Fallbacks only run when the
+        primary fails, so the same account is not hammered concurrently but
+        also does not sit idle while a healthy one exists."""
+        bad = {"tos", "verify"}
+        names = list_profiles()
+        now = time.time()
+
+        def usable(n):
+            st = self.tested.get(n, {})
+            if st.get("status") in bad:
+                return False
+            cd = st.get("cooldown_until") or 0
+            return cd <= now
+
+        ok = [n for n in names if self.tested.get(n, {}).get("status") == "ok" and usable(n)]
+        untested = [n for n in names if self.tested.get(n, {}).get("status") not in bad
+                    and self.tested.get(n, {}).get("status") != "ok" and usable(n)]
+        prim = self.primary()
+        ordered = ([prim] if prim else []) + [n for n in ok if n != prim] + untested
+        if prefer:
+            ordered = ([prefer] if prefer in ordered else []) + \
+                      [n for n in ordered if n != prefer]
+        if not ordered:
+            raise RuntimeError("no usable profile")
+        return ordered
+
+    def pick(self, prefer=None):
+        """Primary only — kept for /admin/test and single-shot calls."""
+        name = self.order(prefer)[0]
+        ws = [w for w in self.ensure(name) if w.alive()]
+        if not ws:
+            raise RuntimeError(f"profile {name} has no live worker")
+        return name, ws[0]
+
+
+POOL = ProfilePool()
+
+
+BANNER_TOS = "terms of service"
+BANNER_VERIFY = ("verification required", "verify your account")
+
+
+def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None):
+    """Yield text pieces for one turn, walking the profile list as a fallback
+    chain. The primary carries the traffic; the next profile is only touched
+    when the primary fails *before* delivering usable text.
+
+    Google's ban banners arrive as ordinary assistant text, so the first slice
+    of the answer is buffered and inspected: if it is a ToS/verification notice,
+    the profile is marked and the turn is retried on the next profile instead of
+    handing the banner back to the caller as if it were an answer.
+    """
+    errors = []
+    for name in POOL.order(prefer):
+        worker = None
+        try:
+            ws = [w for w in POOL.ensure(name) if w.alive()]
+            if not ws:
+                errors.append(f"{name}: no live worker")
+                continue
+            worker = ws[0]
+            if state is not None:
+                state["profile"] = name
+                state["fallback"] = bool(errors)
+            gen = worker.chat(prompt, model=model, timeout=timeout)
+            buf = ""
+            settled = False
+            for piece in gen:
+                if not isinstance(piece, str):
+                    break
+                if settled:
+                    yield piece
+                    continue
+                buf += piece
+                low = buf.lower()
+                if len(buf) >= 160:
+                    settled = True
+                elif any(b in low for b in BANNER_VERIFY):
+                    settled = True
+                elif BANNER_TOS in low:
+                    settled = True
+                if settled and BANNER_TOS in low:
+                    POOL.mark(name, "tos", buf.strip()[:160])
+                    raise RuntimeError("tos banner")
+                if settled and any(b in low for b in BANNER_VERIFY):
+                    POOL.mark(name, "verify", buf.strip()[:160])
+                    raise RuntimeError("verify banner")
+                if settled:
+                    yield buf
+            if buf and not settled:
+                low = buf.lower()
+                if BANNER_TOS in low:
+                    POOL.mark(name, "tos", buf.strip()[:160])
+                    raise RuntimeError("tos banner")
+                if any(b in low for b in BANNER_VERIFY):
+                    POOL.mark(name, "verify", buf.strip()[:160])
+                    raise RuntimeError("verify banner")
+                yield buf
+            return
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            if "tos banner" not in low and "verify banner" not in low:
+                log(f"[{name}] turn failed, falling back: {msg[:160]}")
+                if "429" in msg or "quota" in low or "rate" in low:
+                    POOL.cooldown(name, 300, msg)
+            errors.append(f"{name}: {msg[:120]}")
+    raise RuntimeError("all profiles failed — " + "; ".join(errors))
+
+
+# ---------------------------------------------------------------- helpers
+def flatten(messages):
+    sys_parts, convo = [], []
+    for m in messages:
+        role = m.get("role", "user")
+        c = m.get("content")
+        text = "\n".join(p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text") \
+            if isinstance(c, list) else (c or "")
+        if role == "system":
+            sys_parts.append(text)
+        elif role == "assistant":
+            convo.append(f"Assistant: {text}")
+        else:
+            convo.append(f"User: {text}")
+    body = "\n\n".join(convo).strip()
+    if sys_parts:
+        body = "[System instruction]\n" + "\n".join(sys_parts) + "\n\n" + body
+    return body
+
+
+_model_cache = {"at": 0, "models": []}
+
+
+def models_for(profile=None):
+    if _model_cache["models"] and time.time() - _model_cache["at"] < 300:
+        return _model_cache["models"]
+    args = [AGY, "models"]
+    p = profile or (list_profiles() or ["default"])[0]
+    if p != "default":
+        args += ["--app-data-dir", profile_name(p)]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=40,
+                             env={**os.environ, "HOME": os.environ.get("HOME", "/root")})
+        ms = []
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith(("fetching", "error")):
+                continue
+            tok = line.split("\t")[0].split()[0].strip()
+            if tok:
+                ms.append(tok)
+        ms = list(dict.fromkeys(ms))
+        if ms:
+            _model_cache.update(at=time.time(), models=ms)
+    except Exception as e:
+        log(f"models: {e}")
+    return _model_cache["models"]
+
+
+ADMIN_HTML = """<!doctype html><html><head><meta charset=utf-8><title>agy acp bridge</title>
+<style>body{font:14px/1.5 system-ui,#111;background:#0b0c10;color:#e8e8ea;margin:0;padding:28px}
+h1{font-size:18px;margin:0 0 18px}table{border-collapse:collapse;width:100%;margin-top:10px}
+td,th{border-bottom:1px solid #23252c;padding:8px;text-align:left;font-weight:400}th{color:#8b8f9a}
+input,button{font:inherit;background:#161821;color:#e8e8ea;border:1px solid #2c2f3a;padding:7px 10px;border-radius:6px}
+button{background:#2b6cff;border-color:#2b6cff;cursor:pointer}button:disabled{opacity:.5}
+.url{word-break:break-all;background:#11131a;padding:10px;border-radius:6px;margin:10px 0;font-size:12px}
+.ok{color:#45d483}.bad{color:#ff6b6b}.muted{color:#8b8f9a}
+</style></head><body>
+<h1>agy acp bridge &mdash; accounts</h1>
+<table id=t><thead><tr><th>profile</th><th>status</th><th>last test</th><th></th></tr></thead><tbody></tbody></table>
+<h3>running logins</h3><div id=run class=muted>none</div>
+<h3>add account</h3>
+<input id=prof placeholder="profile name, e.g. permainan10st"><button onclick=start()>start login</button>
+<div id=box></div>
+<script>
+const j=async(u,b)=>{const r=await fetch(u,{method:b?'POST':'GET',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});return r.json()};
+async function load(){const d=await j('/admin/profiles');const tb=document.querySelector('#t tbody');tb.innerHTML='';
+for(const p of d.profiles){const tr=document.createElement('tr');
+tr.innerHTML='<td>'+(p.primary?'&#9733; ':'')+p.name+'</td><td class="'+(p.status==='ok'?'ok':(p.status==='tos'||p.status==='verify')?'bad':'muted')+'">'+p.status+'</td><td class=muted>'+(p.detail||'')+'</td><td><button onclick="test(\''+p.name+'\')">test turn</button> '+(p.primary?'':'<button onclick="primary(\''+p.name+'\')">make primary</button>')+'</td>';tb.appendChild(tr)}}
+async function primary(name){const r=await j('/admin/primary',{profile:name});alert(r.ok?('primary: '+r.primary):('failed: '+r.detail));load()}
+async function start(){const name=document.getElementById('prof').value.trim();if(!name)return;
+const d=await j('/admin/login/start',{profile:name});const box=document.getElementById('box');
+if(!d.ok){box.innerHTML='<div class=bad>'+d.error+'</div>';return}
+box.innerHTML='<div class=muted>open this, sign in, paste the code below</div><div class=url>'+(d.url||'waiting...')+'</div><input id=code placeholder="4/0A..."><button onclick="done(\''+d.loginId+'\')">submit code</button><div id=res></div>'}
+async function done(id){const code=document.getElementById('code').value.trim();
+const r=await j('/admin/login/complete',{loginId:id,code});document.getElementById('res').innerHTML='<span class="'+(r.ok?'ok':'bad')+'">'+(r.detail||'')+'</span>';load()}
+async function running(){const d=await j('/admin/logins');const el=document.getElementById('run');
+if(!d.logins.length){el.textContent='none';return}
+el.innerHTML=d.logins.map(l=>'<div style="margin:8px 0"><b>'+l.profile+'</b><div class=url>'+(l.url||'waiting...')+'</div>'+
+'<input id=c_'+l.id+' placeholder="paste code"><button onclick="fill(\''+l.id+'\')">submit</button></div>').join('')}
+async function fill(id){const code=document.getElementById('c_'+id).value.trim();
+const r=await j('/admin/login/complete',{loginId:id,code});alert(r.ok?('logged in: '+r.detail):('failed: '+r.detail));running();load()}
+async function test(name){const r=await j('/admin/test',{profile:name,model:'gemini-3.8-flash-medium'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
+load();running();setInterval(running,4000);
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _log_req(self):
+        log(f"{self.command} {self.path} from {self.client_address[0]} "
+            f"ua={(self.headers.get('User-Agent') or '-')[:40]}")
+
+    def _json(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def _admin_ok(self):
+        tok = os.environ.get("AGY_ADMIN_TOKEN", "")
+        if not tok:
+            return True
+        return ("t=" + tok) in (self.path or "")
+
+    def _deny_admin(self):
+        self._json(403, {"ok": False, "error": "admin token required"})
+        return None
+
+    def do_GET(self):
+        if self.path.startswith("/admin") and not self._admin_ok():
+            return self._deny_admin()
+        if self.path.startswith("/admin/login/"):
+            lid = self.path.rsplit("/", 1)[-1]
+            lg = LOGINS.get(lid)
+            if not lg:
+                return self._json(404, {"ok": False})
+            return self._json(200, {"ok": True, "url": lg.url, "done": lg.done,
+                                    "result": lg.ok, "detail": lg.detail})
+        if self.path.startswith("/admin/logins"):
+            return self._json(200, {"logins": [
+                {"id": k, "profile": v.profile, "url": v.url,
+                 "done": v.done, "result": v.ok, "detail": v.detail}
+                for k, v in LOGINS.items() if not v.done]})
+        if self.path.startswith("/admin/profiles"):
+            profs = []
+            prim = POOL.primary()
+            for p in list_profiles():
+                st = POOL.tested.get(p) or {"status": "untested", "detail": ""}
+                profs.append({"name": p, "status": st.get("status"),
+                              "primary": p == prim,
+                              "detail": st.get("detail", "")[:120]})
+            return self._json(200, {"profiles": profs, "primary": prim})
+        if self.path.startswith("/admin"):
+            b = ADMIN_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+        if self.path.startswith("/health"):
+            return self._json(200, {"ok": True, "profiles": list_profiles(),
+                                    "workers": {k: [w.alive() for w in v]
+                                                for k, v in POOL.workers.items()}})
+        if self.path.startswith("/v1/models"):
+            return self._json(200, {"object": "list", "data": [
+                {"id": m, "object": "model", "owned_by": "antigravity"} for m in models_for()]})
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        self._log_req()
+        if self.path.startswith("/admin") and not self._admin_ok():
+            return self._deny_admin()
+        if self.path.startswith("/admin/login/start"):
+            b = self._body()
+            prof = (b.get("profile") or "").strip().replace("/", "_")[:40]
+            if not prof:
+                return self._json(400, {"ok": False, "error": "profile required"})
+            lg = Login(prof)
+            LOGINS[lg.id] = lg
+            for _ in range(80):
+                if lg.url or lg.done:
+                    break
+                time.sleep(0.1)
+            return self._json(200, {"ok": True, "loginId": lg.id, "url": lg.url})
+        if self.path.startswith("/admin/login/complete"):
+            b = self._body()
+            lg = LOGINS.get(b.get("loginId"))
+            if not lg:
+                return self._json(404, {"ok": False, "detail": "unknown login"})
+            lg.submit(b.get("code") or "")
+            for _ in range(300):
+                if lg.done:
+                    break
+                time.sleep(0.1)
+            return self._json(200, {"ok": bool(lg.ok), "detail": lg.detail})
+        if self.path.startswith("/admin/primary"):
+            b = self._body()
+            prof = (b.get("profile") or "").strip()
+            if prof not in list_profiles():
+                return self._json(400, {"ok": False, "detail": "unknown profile"})
+            POOL.set_primary(prof)
+            log(f"primary profile set to {prof}")
+            return self._json(200, {"ok": True, "primary": prof})
+        if self.path.startswith("/admin/test"):
+            b = self._body()
+            prof = b.get("profile") or "default"
+            model = b.get("model") or "gemini-3.8-flash-medium"
+            try:
+                ws = [w for w in POOL.ensure(prof) if w.alive()]
+                if not ws:
+                    raise RuntimeError("no live worker")
+                text = "".join(x for x in ws[0].chat("Reply with exactly: OK", model=model,
+                                                     timeout=120) if isinstance(x, str))
+                low = text.lower()
+                if "terms of service" in low:
+                    status = "tos"
+                elif "verification required" in low or "verify your account" in low:
+                    status = "verify"     # alive but needs Google account verification
+                elif not text.strip():
+                    status = "error"
+                else:
+                    status = "ok"
+                POOL.mark(prof, status, text.strip()[:160])
+                return self._json(200, {"ok": status == "ok", "status": status,
+                                        "detail": text.strip()[:200]})
+            except Exception as e:
+                POOL.mark(prof, "error", str(e)[:160])
+                return self._json(200, {"ok": False, "detail": str(e)})
+        if self.path.startswith("/v1/chat/completions"):
+            return self._chat()
+        return self._json(404, {"error": "not found"})
+
+    def _chat(self):
+        body = self._body()
+        prompt = flatten(body.get("messages") or [])
+        raw_model = (body.get("model") or "").strip()
+        prefer = None
+        if "/" in raw_model:
+            prefer, raw_model = raw_model.split("/", 1)
+        stream = bool(body.get("stream"))
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        model = raw_model or None
+        prof = prefer or "?"
+        state = {}
+        try:
+            gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state)
+            if not stream:
+                text = "".join(p for p in gen if isinstance(p, str))
+                prof = state.get("profile", prof)
+                return self._json(200, {
+                    "id": cid, "object": "chat.completion", "created": created,
+                    "model": raw_model or "agy", "profile": prof,
+                    "fallback": state.get("fallback", False),
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": len(prompt) // 4,
+                              "completion_tokens": len(text) // 4,
+                              "total_tokens": (len(prompt) + len(text)) // 4},
+                })
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def sse(o):
+                self.wfile.write(("data: " + json.dumps(o) + "\n\n").encode())
+                self.wfile.flush()
+
+            sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": raw_model or "agy",
+                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            for piece in gen:
+                if not isinstance(piece, str):
+                    continue
+                sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                     "model": raw_model or "agy", "profile": state.get("profile"),
+                     "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+            sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": raw_model or "agy",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"turn error: {e}")
+            try:
+                if stream:
+                    self.wfile.write(("data: " + json.dumps({"error": {"message": str(e)}}) +
+                                      "\n\n").encode())
+                    self.wfile.flush()
+                else:
+                    self._json(500, {"error": {"message": str(e)}})
+            except Exception:
+                pass
+
+
+def main():
+    log(f"agy-acp-bridge v2 on 127.0.0.1:{PORT}, profiles={list_profiles()}")
+    bind = os.environ.get("AGY_BRIDGE_BIND", "127.0.0.1")
+    srv = ThreadingHTTPServer((bind, PORT), Handler)
+    srv.daemon_threads = True
+    log("listening")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
