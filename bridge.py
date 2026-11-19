@@ -548,6 +548,82 @@ def _drain(gen, name):
 
 
 # ---------------------------------------------------------------- helpers
+def tools_prompt(tools):
+    """Describe the caller's functions to the agent and ask for a JSON call.
+
+    agy only knows its OWN built-in tools, so handing it the caller's schemas
+    through ACP is not possible without an MCP bridge. Prompted tool calling
+    works with any model: describe the functions, demand a strict JSON reply,
+    parse it back into OpenAI tool_calls.
+    """
+    specs = []
+    for t in tools or []:
+        fn = (t or {}).get("function") or {}
+        if not fn.get("name"):
+            continue
+        specs.append({"name": fn["name"],
+                      "description": fn.get("description", ""),
+                      "parameters": fn.get("parameters", {})})
+    if not specs:
+        return ""
+    return (
+        "\n\n[Available functions]\n" + json.dumps(specs, ensure_ascii=False) +
+        "\n\nIf answering requires one of these functions, reply with ONLY this JSON, "
+        'no prose, no code fence: {"tool_calls":[{"name":"<function>","arguments":{...}}]}'
+        "\nIf no function is needed, answer normally in plain text. "
+        "Do not run commands or use your own built-in tools.]"
+    )
+
+
+def parse_tool_reply(text):
+    """Pull a prompted tool call out of the model's reply, if there is one."""
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    if not s.startswith("{"):
+        i, j = s.find("{"), s.rfind("}")
+        if i < 0 or j <= i:
+            return None
+        s = s[i:j + 1]
+    try:
+        d = json.loads(s)
+    except Exception:
+        return None
+    calls = d.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    out = []
+    for k, c in enumerate(calls):
+        name = c.get("name") or c.get("function")
+        if not name:
+            continue
+        args = c.get("arguments", c.get("args", {}))
+        out.append({"id": f"call_{uuid.uuid4().hex[:16]}", "type": "function",
+                    "function": {"name": name,
+                                 "arguments": args if isinstance(args, str)
+                                 else json.dumps(args, ensure_ascii=False)}})
+    return out or None
+
+
+def apply_output_limits(text, max_tokens=None, stop=None):
+    """Emulate stop sequences and max_tokens, which the CLI does not accept."""
+    finish = "stop"
+    cut = None
+    for s in (stop if isinstance(stop, list) else [stop] if stop else []):
+        if s and s in text:
+            i = text.index(s)
+            cut = i if cut is None else min(cut, i)
+    if cut is not None:
+        text = text[:cut]
+    if max_tokens:
+        # ~4 chars per token, same approximation the usage field already uses
+        limit = int(max_tokens) * 4
+        if len(text) > limit:
+            text = text[:limit]
+            finish = "length"
+    return text, finish
+
+
 def _image_block(part):
     """OpenAI image_url part -> ACP image ContentBlock (base64 + mimeType).
 
@@ -827,13 +903,11 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self):
         body = self._body()
         prompt, images = flatten(body.get("messages") or [])
-        if body.get("tools"):
-            # agy proposes its OWN built-in tools (run_command, read_file…), which
-            # the caller cannot execute — the bridge sandboxes and denies them, so
-            # the turn used to end with no message text at all. Ask for prose; if
-            # the agent still proposes a tool, it is surfaced as OpenAI tool_calls.
-            prompt += ("\n\n[Reply in plain text only. Do not run commands or use "
-                       "your own tools — answer directly from what you know.]")
+        tools = body.get("tools") or []
+        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
+        stop = body.get("stop")
+        if tools:
+            prompt += tools_prompt(tools)
         raw_model = (body.get("model") or "").strip()
         prefer = None
         if "/" in raw_model:
@@ -856,6 +930,13 @@ class Handler(BaseHTTPRequestHandler):
                     elif isinstance(piece, dict) and "__tools__" in piece:
                         tcalls = piece["__tools__"]
                 text = "".join(parts)
+                if tools and not tcalls:
+                    tcalls = parse_tool_reply(text) or []
+                    if tcalls:
+                        text = ""
+                text, finish = apply_output_limits(text, max_tokens, stop)
+                if tcalls:
+                    finish = "tool_calls"
                 prof = state.get("profile", prof)
                 message = {"role": "assistant", "content": text}
                 if tcalls:
@@ -865,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
                     "model": raw_model or "agy", "profile": prof,
                     "fallback": state.get("fallback", False),
                     "choices": [{"index": 0, "message": message,
-                                 "finish_reason": "tool_calls" if tcalls else "stop"}],
+                                 "finish_reason": finish}],
                     "usage": {"prompt_tokens": len(prompt) // 4,
                               "completion_tokens": len(text) // 4,
                               "total_tokens": (len(prompt) + len(text)) // 4},
@@ -884,15 +965,42 @@ class Handler(BaseHTTPRequestHandler):
                  "model": raw_model or "agy",
                  "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
             tcalls = []
-            for piece in gen:
-                if isinstance(piece, dict) and "__tools__" in piece:
-                    tcalls = piece["__tools__"]
-                    continue
-                if not isinstance(piece, str):
-                    continue
-                sse({"id": cid, "object": "chat.completion.chunk", "created": created,
-                     "model": raw_model or "agy", "profile": state.get("profile"),
-                     "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+            if tools or max_tokens or stop:
+                # these need the whole answer before it can be judged: a prompted
+                # tool call is only valid once the JSON is complete, and a stop
+                # sequence may straddle two chunks. Buffer, then emit.
+                parts = []
+                for piece in gen:
+                    if isinstance(piece, dict) and "__tools__" in piece:
+                        tcalls = piece["__tools__"]
+                    elif isinstance(piece, str):
+                        parts.append(piece)
+                text = "".join(parts)
+                if tools and not tcalls:
+                    tcalls = parse_tool_reply(text) or []
+                    if tcalls:
+                        text = ""
+                text, finish = apply_output_limits(text, max_tokens, stop)
+                if tcalls:
+                    finish = "tool_calls"
+                if text:
+                    sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                         "model": raw_model or "agy", "profile": state.get("profile"),
+                         "choices": [{"index": 0, "delta": {"content": text},
+                                      "finish_reason": None}]})
+            else:
+                finish = "stop"
+                for piece in gen:
+                    if isinstance(piece, dict) and "__tools__" in piece:
+                        tcalls = piece["__tools__"]
+                        continue
+                    if not isinstance(piece, str):
+                        continue
+                    sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                         "model": raw_model or "agy", "profile": state.get("profile"),
+                         "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+                if tcalls:
+                    finish = "tool_calls"
             if tcalls:
                 sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                      "model": raw_model or "agy",
@@ -901,8 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
                          "finish_reason": None}]})
             sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": raw_model or "agy",
-                 "choices": [{"index": 0, "delta": {},
-                              "finish_reason": "tool_calls" if tcalls else "stop"}]})
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
