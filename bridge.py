@@ -273,6 +273,10 @@ class AgyWorker:
                         log(f"[{self.profile}] set_model {model}: {e}")
                 q = queue.Queue()
                 self.turn_q[sid] = q
+                seen = {}
+                thoughts = []
+                tools_out = {}
+                emitted = False
                 mid = self.next_id
                 self.next_id += 1
                 self.id_q[mid] = q
@@ -292,14 +296,46 @@ class AgyWorker:
                         continue
                     if kind == "update":
                         u = msg
+                        kind_name = u.get("sessionUpdate") or "?"
+                        seen[kind_name] = seen.get(kind_name, 0) + 1
+                        if kind_name in ("tool_call", "tool_call_update"):
+                            tc_id = u.get("toolCallId")
+                            if tc_id:
+                                slot = tools_out.setdefault(tc_id, {
+                                    "id": tc_id, "type": "function",
+                                    "function": {"name": "", "arguments": ""}})
+                                fn = slot["function"]
+                                if u.get("name"):
+                                    fn["name"] = u["name"]
+                                elif u.get("title") and not fn["name"]:
+                                    fn["name"] = str(u["title"])[:60]
+                                raw = u.get("rawInput")
+                                if raw is not None:
+                                    fn["arguments"] = json.dumps(raw)
+                        if kind_name == "agent_thought_chunk":
+                            c = u.get("content") or {}
+                            if c.get("type") == "text" and c.get("text"):
+                                thoughts.append(c["text"])
                         if u.get("sessionUpdate") == "agent_message_chunk":
                             c = u.get("content") or {}
                             if c.get("type") == "text" and c.get("text"):
+                                emitted = True
                                 yield c["text"]
                         continue
                     if kind == "response":
                         if "error" in msg:
                             raise RuntimeError(msg["error"].get("message"))
+                        if not emitted:
+                            usable = [t for t in tools_out.values()
+                                      if t["function"]["name"]]
+                            if usable:
+                                # the agent proposed tool calls instead of prose;
+                                # hand them to the client as OpenAI tool_calls
+                                yield {"__tools__": usable}
+                            else:
+                                log(f"[{self.profile}] EMPTY turn, updates={seen}")
+                                if thoughts:
+                                    yield "".join(thoughts)
                         yield {"__done__": True}
                         return
             finally:
@@ -474,6 +510,9 @@ def _drain(gen, name):
     buf = ""
     settled = False
     for piece in gen:
+        if isinstance(piece, dict) and "__tools__" in piece:
+            yield piece
+            break
         if not isinstance(piece, str):
             break
         if settled:
@@ -737,6 +776,13 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self):
         body = self._body()
         prompt = flatten(body.get("messages") or [])
+        if body.get("tools"):
+            # agy proposes its OWN built-in tools (run_command, read_file…), which
+            # the caller cannot execute — the bridge sandboxes and denies them, so
+            # the turn used to end with no message text at all. Ask for prose; if
+            # the agent still proposes a tool, it is surfaced as OpenAI tool_calls.
+            prompt += ("\n\n[Reply in plain text only. Do not run commands or use "
+                       "your own tools — answer directly from what you know.]")
         raw_model = (body.get("model") or "").strip()
         prefer = None
         if "/" in raw_model:
@@ -751,14 +797,23 @@ class Handler(BaseHTTPRequestHandler):
         try:
             gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state)
             if not stream:
-                text = "".join(p for p in gen if isinstance(p, str))
+                parts, tcalls = [], []
+                for piece in gen:
+                    if isinstance(piece, str):
+                        parts.append(piece)
+                    elif isinstance(piece, dict) and "__tools__" in piece:
+                        tcalls = piece["__tools__"]
+                text = "".join(parts)
                 prof = state.get("profile", prof)
+                message = {"role": "assistant", "content": text}
+                if tcalls:
+                    message["tool_calls"] = tcalls
                 return self._json(200, {
                     "id": cid, "object": "chat.completion", "created": created,
                     "model": raw_model or "agy", "profile": prof,
                     "fallback": state.get("fallback", False),
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                 "finish_reason": "stop"}],
+                    "choices": [{"index": 0, "message": message,
+                                 "finish_reason": "tool_calls" if tcalls else "stop"}],
                     "usage": {"prompt_tokens": len(prompt) // 4,
                               "completion_tokens": len(text) // 4,
                               "total_tokens": (len(prompt) + len(text)) // 4},
@@ -776,15 +831,26 @@ class Handler(BaseHTTPRequestHandler):
             sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": raw_model or "agy",
                  "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            tcalls = []
             for piece in gen:
+                if isinstance(piece, dict) and "__tools__" in piece:
+                    tcalls = piece["__tools__"]
+                    continue
                 if not isinstance(piece, str):
                     continue
                 sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                      "model": raw_model or "agy", "profile": state.get("profile"),
                      "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+            if tcalls:
+                sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                     "model": raw_model or "agy",
+                     "choices": [{"index": 0, "delta": {"tool_calls": [
+                         {"index": i, **t} for i, t in enumerate(tcalls)]},
+                         "finish_reason": None}]})
             sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": raw_model or "agy",
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                 "choices": [{"index": 0, "delta": {},
+                              "finish_reason": "tool_calls" if tcalls else "stop"}]})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
