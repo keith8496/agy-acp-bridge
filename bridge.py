@@ -17,12 +17,14 @@ Endpoints
   GET  /v1/models
   POST /v1/chat/completions       stream + non-stream (model "profile/model" pins)
 """
+import base64
 import json
 import os
 import queue
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -249,7 +251,7 @@ class AgyWorker:
                 raise RuntimeError(f"{method}: {msg['error'].get('message')}")
             return msg.get("result", {})
 
-    def chat(self, text, model=None, timeout=None, lock_wait=None):
+    def chat(self, text, model=None, timeout=None, lock_wait=None, images=None):
         timeout = timeout or TURN_TIMEOUT
         # A generator holds this lock for the whole turn. If a client disconnects
         # mid-stream the generator must be closed by the caller, otherwise the
@@ -280,9 +282,9 @@ class AgyWorker:
                 mid = self.next_id
                 self.next_id += 1
                 self.id_q[mid] = q
+                blocks = [{"type": "text", "text": text}] + list(images or [])
                 self._send({"jsonrpc": "2.0", "id": mid, "method": "session/prompt",
-                            "params": {"sessionId": sid,
-                                       "prompt": [{"type": "text", "text": text}]}})
+                            "params": {"sessionId": sid, "prompt": blocks}})
                 deadline = time.time() + timeout
                 while True:
                     left = deadline - time.time()
@@ -464,7 +466,7 @@ BANNER_TOS = "terms of service"
 BANNER_VERIFY = ("verification required", "verify your account")
 
 
-def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None):
+def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None, images=None):
     """Yield text pieces for one turn, walking the profile list as a fallback
     chain. The primary carries the traffic; the next profile is only touched
     when the primary fails *before* delivering usable text.
@@ -486,7 +488,7 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
             if state is not None:
                 state["profile"] = name
                 state["fallback"] = bool(errors)
-            gen = worker.chat(prompt, model=model, timeout=timeout)
+            gen = worker.chat(prompt, model=model, timeout=timeout, images=images)
             try:
                 yield from _drain(gen, name)
                 return
@@ -546,14 +548,63 @@ def _drain(gen, name):
 
 
 # ---------------------------------------------------------------- helpers
+def _image_block(part):
+    """OpenAI image_url part -> ACP image ContentBlock (base64 + mimeType).
+
+    ACP's ContentBlock is a superset of MCP's: {type:image, data, mimeType}.
+    Remote URLs are fetched here because the agent process has no business
+    reaching out to arbitrary hosts on the caller's behalf.
+    """
+    iu = part.get("image_url") or part.get("imageUrl") or {}
+    url = iu.get("url") if isinstance(iu, dict) else iu
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        try:
+            header, b64 = url.split(",", 1)
+            mime = header[5:].split(";")[0] or "image/png"
+            return {"type": "image", "data": b64, "mimeType": mime}
+        except Exception:
+            return None
+    if url.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "agy-acp-bridge"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                mime = r.headers.get("Content-Type", "image/png").split(";")[0]
+            return {"type": "image",
+                    "data": base64.b64encode(raw).decode(),
+                    "mimeType": mime}
+        except Exception as e:
+            log(f"image fetch failed: {str(e)[:120]}")
+            return None
+    # bare base64
+    return {"type": "image", "data": url, "mimeType": part.get("mimeType") or "image/png"}
+
+
 def flatten(messages):
-    sys_parts, convo = [], []
+    """Return (prompt_text, image_blocks). Images used to be silently dropped,
+    which is why the agent answered that it could not see the picture."""
+    sys_parts, convo, images = [], [], []
     for m in messages:
         role = m.get("role", "user")
         c = m.get("content")
-        text = "\n".join(p.get("text", "") for p in c
-                         if isinstance(p, dict) and p.get("type") == "text") \
-            if isinstance(c, list) else (c or "")
+        if isinstance(c, list):
+            texts = []
+            for p in c:
+                if not isinstance(p, dict):
+                    continue
+                kind = p.get("type")
+                if kind == "text":
+                    texts.append(p.get("text", ""))
+                elif kind in ("image_url", "image", "input_image"):
+                    blk = _image_block(p)
+                    if blk:
+                        images.append(blk)
+                        texts.append("[image attached]")
+            text = "\n".join(texts)
+        else:
+            text = c or ""
         if role == "system":
             sys_parts.append(text)
         elif role == "assistant":
@@ -563,7 +614,7 @@ def flatten(messages):
     body = "\n\n".join(convo).strip()
     if sys_parts:
         body = "[System instruction]\n" + "\n".join(sys_parts) + "\n\n" + body
-    return body
+    return body, images
 
 
 _model_cache = {"at": 0, "models": []}
@@ -775,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat(self):
         body = self._body()
-        prompt = flatten(body.get("messages") or [])
+        prompt, images = flatten(body.get("messages") or [])
         if body.get("tools"):
             # agy proposes its OWN built-in tools (run_command, read_file…), which
             # the caller cannot execute — the bridge sandboxes and denies them, so
@@ -795,7 +846,8 @@ class Handler(BaseHTTPRequestHandler):
         state = {}
         gen = None
         try:
-            gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state)
+            gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state,
+                                     images=images)
             if not stream:
                 parts, tcalls = [], []
                 for piece in gen:
