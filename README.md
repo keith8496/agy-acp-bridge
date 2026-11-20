@@ -217,6 +217,54 @@ scripts/
   audit_compare.py         behaviour + latency vs a normal OpenAI provider
 ```
 
+## Tool calling
+
+ACP has no OpenAI `tools` channel, so the caller's function schemas travel in
+the prompt and the model answers with `tool_call` blocks in **OpenAI
+function-call shape** (`id`, `type`, `function{name, arguments}`), where
+`arguments` is a JSON **string**. The bridge extracts those blocks and removes
+them from `content`, so raw JSON never reaches the client. Prose around the
+blocks survives; several blocks become several calls.
+
+Three ordered patterns are tried: tagged blocks, bare OpenAI-shaped JSON, then
+the legacy `{"tool_calls":[...]}` envelope. Requiring `id`/`type`/`function` in
+the bare-JSON pattern is what keeps a JSON-mode answer such as
+`{"city":"Jakarta","temp":30}` from being eaten as a tool call.
+
+Unknown function names are dropped against the caller's declared list. The
+agent's own tools (`run_command`, ...) are **never** surfaced to a client that
+declared its own functions.
+
+### Keeping the agent from running its own tools
+
+Prompt-level prohibition does not work: the agent's internal system prompt wins
+and it still reaches for `run_command` on action-shaped requests. The reliable
+lever is the CLI's own `PreToolUse` hook, which can hard-block execution and
+whose `reason` string is fed back to the model.
+
+Install the two files from `hooks/` into the **session working directory**
+(the `cwd` passed to `session/new`, i.e. `AGY_CWD`), as `.agents/hooks.json` and
+`.agents/deny_builtin.py`. Discovery walks up from that cwd, so putting them
+next to `bridge.py` silently does nothing.
+
+Denial is **conditional per session**: the bridge writes
+`<AGY_CWD>/.bridge-mode/<sessionId>.json` when the request declared tools, and
+the hook handler reads `conversationId` from its stdin payload to decide. With
+client tools the built-in action tools are denied and the model emits the
+caller's function; without client tools the agent keeps its own abilities.
+Every decision is appended to `/var/log/agy-bridge-hooks.log`.
+
+The matcher lists action tools explicitly and never uses a wildcard: the loop's
+own control tools (e.g. `finish`) must stay allowed or a turn never terminates.
+
+If the agent still produces only a native call and no text, the bridge corrects
+it **inside the same session** (up to `AGY_TOOL_RETRIES`, default 1) — asking for
+a contract block when the client declared tools, or for a plain-text answer when
+it did not — and only then fails over or translates as a last resort.
+
+Offline parser tests: `python3 scripts/tool_extract_test.py` (no model, no
+network). Live probes: `scripts/tools_leak_test.py`, `scripts/tool_mode_probe.py`.
+
 ## Latency: live session reuse
 
 A request that continues a conversation reuses the ACP session that already

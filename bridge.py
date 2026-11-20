@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -42,6 +43,18 @@ LOCK_WAIT = int(os.environ.get("AGY_LOCK_WAIT", "20"))
 # A turn that produces NO event for this long is wedged upstream: cancel
 # it and fail over instead of holding the worker until TURN_TIMEOUT.
 STALL_TIMEOUT = int(os.environ.get("AGY_STALL_TIMEOUT", "120"))
+# In-session corrections when the agent reaches for its own tools.
+TOOL_RETRIES = max(0, int(os.environ.get("AGY_TOOL_RETRIES", "1")))
+PLAIN_RETRY_NUDGE = ("Do not use any tool for this. Answer the user's "
+                     "question directly in plain text, using what you already "
+                     "know or can see in the conversation.")
+
+TOOL_RETRY_NUDGE = ("You used your own built-in tool. Built-in tools are NOT "
+                    "available in this mode. Fulfil the user's request by emitting "
+                    "the call as a <tool_call>{...}</tool_call> block in OpenAI "
+                    "function-call shape, with arguments as a JSON string. Do not "
+                    "run anything else; just emit the block.")
+
 WORKERS_PER_PROFILE = max(1, int(os.environ.get("AGY_WORKERS_PER_PROFILE", "1")))
 # Session cache: a request that extends a conversation we already
 # have in a live ACP session only sends the new tail.
@@ -240,6 +253,7 @@ class AgyWorker:
         e = self.sessions.pop(key, None)
         if not e:
             return
+        self._clear_tool_mode(e["sid"])
         try:
             self.rpc("session/close", {"sessionId": e["sid"]}, 5)
             self.stats["closed"] += 1
@@ -253,6 +267,7 @@ class AgyWorker:
             if e["sid"] == sid:
                 self._drop_session(k, reason)
                 return
+        self._clear_tool_mode(sid)
         try:
             self.rpc("session/close", {"sessionId": sid}, 5)
         except Exception:
@@ -266,6 +281,31 @@ class AgyWorker:
         while len(self.sessions) > SESSION_MAX:
             oldest = min(self.sessions.items(), key=lambda kv: kv[1]["last"])[0]
             self._drop_session(oldest, "lru")
+
+    def _set_tool_mode(self, sid, client_tools):
+        """Tell the PreToolUse hook whether this session's client declared tools.
+
+        The hook payload carries conversationId == ACP sessionId, so a marker
+        file per session makes denial conditional without any shared state
+        between concurrent workers.
+        """
+        d = os.path.join(WORKDIR, ".bridge-mode")
+        p = os.path.join(d, sid + ".json")
+        try:
+            if client_tools:
+                os.makedirs(d, exist_ok=True)
+                with open(p, "w") as f:
+                    json.dump({"client_tools": True}, f)
+            elif os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            log(f"[{self.profile}] tool-mode marker: {str(e)[:80]}")
+
+    def _clear_tool_mode(self, sid):
+        try:
+            os.remove(os.path.join(WORKDIR, ".bridge-mode", sid + ".json"))
+        except Exception:
+            pass
 
     def warm(self):
         """Pay the one-time first-session cost before a real request lands."""
@@ -357,7 +397,7 @@ class AgyWorker:
             return msg.get("result", {})
 
     def chat(self, text, model=None, timeout=None, lock_wait=None, images=None,
-             segments=None, suffix=""):
+             segments=None, suffix="", client_tools=False):
         timeout = timeout or TURN_TIMEOUT
         # A generator holds this lock for the whole turn. If a client disconnects
         # mid-stream the generator must be closed by the caller, otherwise the
@@ -414,12 +454,14 @@ class AgyWorker:
                         self.sessions[sess_key] = {"sid": sid, "model": model or "",
                                                    "hashes": hashes, "last": time.time()}
                         self._cleanup_sessions()
+                self._set_tool_mode(sid, client_tools)
                 q = queue.Queue()
                 self.turn_q[sid] = q
                 seen = {}
                 thoughts = []
                 tools_out = {}
                 emitted = False
+                retries = 0
                 mid = self.next_id
                 self.next_id += 1
                 self.id_q[mid] = q
@@ -479,6 +521,42 @@ class AgyWorker:
                     if kind == "response":
                         if "error" in msg:
                             raise RuntimeError(msg["error"].get("message"))
+                        if not emitted and any(
+                                t["function"]["name"] for t in tools_out.values()):
+                            # the agent ran its OWN tool instead of emitting the
+                            # caller's function. Never surface that: the client would
+                            # get a function it never declared, with internal argument
+                            # names. Correct it inside the same session (the context is
+                            # already there, so this is cheap) and only fail over when
+                            # it keeps insisting.
+                            if retries < TOOL_RETRIES:
+                                retries += 1
+                                log(f"[{self.profile}] agent used built-in tools "
+                                    f"({'contract' if client_tools else 'plain-text'} "
+                                    f"correction, try {retries})")
+                                tools_out.clear()
+                                seen.clear()
+                                thoughts.clear()
+                                mid = self.next_id
+                                self.next_id += 1
+                                self.id_q[mid] = q
+                                self._send({"jsonrpc": "2.0", "id": mid,
+                                            "method": "session/prompt",
+                                            "params": {"sessionId": sid, "prompt": [
+                                                {"type": "text",
+                                                 "text": TOOL_RETRY_NUDGE if client_tools
+                                                 else PLAIN_RETRY_NUDGE}]}})
+                                deadline = time.time() + timeout
+                                last_evt = time.time()
+                                continue
+                            if client_tools:
+                                log(f"[{self.profile}] agent kept using built-in tools")
+                                raise RuntimeError("agent used built-in tools instead of "
+                                                   "the caller's functions")
+                            # no client tools: a native call is still better than an
+                            # empty completion, so fall through and translate it
+                            log(f"[{self.profile}] no text after correction, "
+                                "translating native call as last resort")
                         # the turn is complete: keep the session and rekey it on
                         # the full incoming history BEFORE any yield, so a client
                         # that stops reading at tool_calls does not orphan it
@@ -633,7 +711,7 @@ BANNER_VERIFY = ("verification required", "verify your account")
 
 
 def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None, images=None,
-                       segments=None, suffix=""):
+                       segments=None, suffix="", client_tools=False):
     """Yield text pieces for one turn, walking the profile list as a fallback
     chain. The primary carries the traffic; the next profile is only touched
     when the primary fails *before* delivering usable text.
@@ -656,7 +734,7 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
                 state["profile"] = name
                 state["fallback"] = bool(errors)
             gen = worker.chat(prompt, model=model, timeout=timeout, images=images,
-                              segments=segments, suffix=suffix)
+                              segments=segments, suffix=suffix, client_tools=client_tools)
             try:
                 yield from _drain(gen, name)
                 return
@@ -716,13 +794,20 @@ def _drain(gen, name):
 
 
 # ---------------------------------------------------------------- helpers
-def tools_prompt(tools):
-    """Describe the caller's functions to the agent and ask for a JSON call.
+TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+TOOL_CALL_JSON_RE = re.compile(
+    r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,"
+    r"\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
-    agy only knows its OWN built-in tools, so handing it the caller's schemas
-    through ACP is not possible without an MCP bridge. Prompted tool calling
-    works with any model: describe the functions, demand a strict JSON reply,
-    parse it back into OpenAI tool_calls.
+
+def tools_prompt(tools, tool_choice=None):
+    """Describe the caller's functions and demand OpenAI-shaped tool_call blocks.
+
+    agy only knows its OWN built-in tools, so the caller's schemas cannot be
+    handed over through ACP without an MCP bridge. Prompted tool calling works
+    with any model. The contract is delimiter-based (<tool_call>...</tool_call>) rather than
+    "reply with only JSON": prose and several calls can coexist, and the blocks
+    are cut out of the answer so raw JSON never reaches the client as content.
     """
     specs = []
     for t in tools or []:
@@ -734,43 +819,114 @@ def tools_prompt(tools):
                       "parameters": fn.get("parameters", {})})
     if not specs:
         return ""
-    return (
-        "\n\n[Available functions]\n" + json.dumps(specs, ensure_ascii=False) +
-        "\n\nIf answering requires one of these functions, reply with ONLY this JSON, "
-        'no prose, no code fence: {"tool_calls":[{"name":"<function>","arguments":{...}}]}'
-        "\nIf no function is needed, answer normally in plain text. "
-        "Do not run commands or use your own built-in tools.]"
-    )
+    example = ('<tool_call>{"id":"call_1","type":"function","function":{"name":"FN",'
+               '"arguments":"{\\"key\\":\\"value\\"}"}}</tool_call>')
+    out = ("\n\n[Available functions]\n" + json.dumps(specs, ensure_ascii=False) +
+           "\n\nTo call one, emit <tool_call>...</tool_call> blocks: one JSON object per call, "
+           "exactly in OpenAI function-call shape, e.g.\n" + example +
+           "\narguments MUST be a JSON string. Several blocks and prose around them "
+           "are fine. You have NO built-in tools in this mode: run_command, read_file, "
+           "search and every other internal tool are unavailable and must not be used. "
+           "The functions above are the only way to act. If no function is needed, "
+           "answer in plain text with no tool_call block.]")
+    if tool_choice is not None:
+        out += "\n[Tool choice hint: " + json.dumps(tool_choice, ensure_ascii=False) + "]"
+    return out
+
+
+def _tool_call_obj(obj, allowed=None):
+    """One parsed JSON object -> OpenAI tool_call, or None. Accepts the OpenAI
+    shape and the older bare {name, arguments} envelope."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function")
+    if not isinstance(fn, dict):
+        name = obj.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        fn = {"name": name, "arguments": obj.get("arguments", obj.get("args", {}))}
+        obj = {}
+    name = fn.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    if allowed is not None and name not in allowed:
+        log(f"tool call for unknown function {name!r} dropped")
+        return None
+    args = fn.get("arguments", "{}")
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    cid = obj.get("id")
+    if not isinstance(cid, str) or not cid.strip():
+        cid = "call_" + uuid.uuid4().hex[:16]
+    return {"id": cid, "type": "function",
+            "function": {"name": name, "arguments": args}}
+
+
+def _strip_spans(text, spans):
+    spans = sorted(spans)
+    merged = []
+    for s, e in spans:
+        if not merged or s > merged[-1][1]:
+            merged.append((s, e))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+    parts, cur = [], 0
+    for s, e in merged:
+        if cur < s:
+            parts.append(text[cur:s])
+        cur = max(cur, e)
+    if cur < len(text):
+        parts.append(text[cur:])
+    return "\n".join(p.strip() for p in parts if p and p.strip()).strip()
+
+
+def extract_tool_calls(text, allowed=None):
+    """(tool_calls, cleaned_text). Consumed blocks are removed from the answer.
+
+    Order: <tool_call> blocks, then bare OpenAI-shaped JSON, then the legacy
+    {"tool_calls":[...]} envelope. The first pattern that yields a call wins.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return [], (text or "").strip()
+    calls, spans = [], []
+    for pattern, group in ((TOOL_CALL_BLOCK_RE, 1), (TOOL_CALL_JSON_RE, 0)):
+        for m in pattern.finditer(text):
+            try:
+                obj = json.loads(m.group(group))
+            except Exception:
+                obj = None
+            if obj is not None:
+                c = _tool_call_obj(obj, allowed)
+                if c:
+                    calls.append(c)
+            spans.append((m.start(), m.end()))
+        if calls:
+            break
+    if calls:
+        return calls, _strip_spans(text, spans)
+    # legacy envelope: {"tool_calls":[{"name":...,"arguments":{...}}]}
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    i, j = s.find("{"), s.rfind("}")
+    if i >= 0 and j > i:
+        body = s[i:j + 1]
+        try:
+            d = json.loads(body)
+        except Exception:
+            d = None
+        if isinstance(d, dict) and isinstance(d.get("tool_calls"), list):
+            out = [c for c in (_tool_call_obj(x, allowed) for x in d["tool_calls"]) if c]
+            if out:
+                cleaned = (s[:i] + " " + s[j + 1:]).strip()
+                return out, cleaned
+    return [], text.strip()
 
 
 def parse_tool_reply(text):
-    """Pull a prompted tool call out of the model's reply, if there is one."""
-    s = (text or "").strip()
-    if s.startswith("```"):
-        s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    if not s.startswith("{"):
-        i, j = s.find("{"), s.rfind("}")
-        if i < 0 or j <= i:
-            return None
-        s = s[i:j + 1]
-    try:
-        d = json.loads(s)
-    except Exception:
-        return None
-    calls = d.get("tool_calls")
-    if not isinstance(calls, list) or not calls:
-        return None
-    out = []
-    for k, c in enumerate(calls):
-        name = c.get("name") or c.get("function")
-        if not name:
-            continue
-        args = c.get("arguments", c.get("args", {}))
-        out.append({"id": f"call_{uuid.uuid4().hex[:16]}", "type": "function",
-                    "function": {"name": name,
-                                 "arguments": args if isinstance(args, str)
-                                 else json.dumps(args, ensure_ascii=False)}})
-    return out or None
+    """Back-compat wrapper: only the calls, no cleaned text."""
+    return extract_tool_calls(text)[0] or None
 
 
 def apply_output_limits(text, max_tokens=None, stop=None):
@@ -1077,7 +1233,8 @@ class Handler(BaseHTTPRequestHandler):
         tools = body.get("tools") or []
         max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         stop = body.get("stop")
-        tools_text = tools_prompt(tools) if tools else ""
+        tools_text = tools_prompt(tools, body.get("tool_choice")) if tools else ""
+        allowed = {((t or {}).get("function") or {}).get("name") for t in tools} if tools else None
         if tools_text:
             prompt += tools_text
         raw_model = (body.get("model") or "").strip()
@@ -1093,7 +1250,8 @@ class Handler(BaseHTTPRequestHandler):
         gen = None
         try:
             gen = turn_with_fallback(prompt, model=model, prefer=prefer, state=state,
-                                     images=images, segments=messages, suffix=tools_text)
+                                     images=images, segments=messages, suffix=tools_text,
+                                     client_tools=bool(tools))
             if not stream:
                 parts, tcalls = [], []
                 for piece in gen:
@@ -1103,9 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                         tcalls = piece["__tools__"]
                 text = "".join(parts)
                 if tools and not tcalls:
-                    tcalls = parse_tool_reply(text) or []
-                    if tcalls:
-                        text = ""
+                    tcalls, text = extract_tool_calls(text, allowed)
                 text, finish = apply_output_limits(text, max_tokens, stop)
                 if tcalls:
                     finish = "tool_calls"
@@ -1149,9 +1305,7 @@ class Handler(BaseHTTPRequestHandler):
                         parts.append(piece)
                 text = "".join(parts)
                 if tools and not tcalls:
-                    tcalls = parse_tool_reply(text) or []
-                    if tcalls:
-                        text = ""
+                    tcalls, text = extract_tool_calls(text, allowed)
                 text, finish = apply_output_limits(text, max_tokens, stop)
                 if tcalls:
                     finish = "tool_calls"
