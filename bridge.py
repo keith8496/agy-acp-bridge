@@ -881,6 +881,47 @@ def _strip_spans(text, spans):
     return "\n".join(p.strip() for p in parts if p and p.strip()).strip()
 
 
+def _parse_bare_calls(text, allowed):
+    """Bare {name, arguments} objects — the shape agent CLIs like OpenCode ask
+    their models for, ignoring this bridge's tag contract.
+
+    Only accepted when the name matches a declared function, so a JSON-mode
+    answer such as {"city":"Jakarta","temp":30} is never mistaken for a call.
+    """
+    if not allowed or not isinstance(text, str) or not text.strip():
+        return None, text
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    base = text.find(s)
+    if base < 0:
+        base = 0
+    cand, span = None, None
+    try:
+        cand, span = json.loads(s), (base, base + len(s))
+    except Exception:
+        for op, cl in (("{", "}"), ("[", "]")):
+            i, j = s.find(op), s.rfind(cl)
+            if i >= 0 and j > i:
+                try:
+                    cand = json.loads(s[i:j + 1])
+                    span = (base + i, base + j + 1)
+                    break
+                except Exception:
+                    continue
+    if cand is None:
+        return None, text
+    items = cand if isinstance(cand, list) else [cand]
+    calls = [c for c in (_tool_call_obj(x, allowed) for x in items) if c]
+    if not calls:
+        return None, text
+    if span and (span[0] > 0 or span[1] < len(text)):
+        cleaned = (text[:span[0]] + " " + text[span[1]:]).strip()
+    else:
+        cleaned = ""
+    return calls, cleaned
+
+
 def extract_tool_calls(text, allowed=None):
     """(tool_calls, cleaned_text). Consumed blocks are removed from the answer.
 
@@ -921,6 +962,12 @@ def extract_tool_calls(text, allowed=None):
             if out:
                 cleaned = (s[:i] + " " + s[j + 1:]).strip()
                 return out, cleaned
+    # some agent CLIs (OpenCode et al.) put their own tool format in the model's
+    # system prompt, so the reply is a bare {name, arguments} object with no tag
+    # and no wrapper. Accept it only against the caller's declared names.
+    bare, cleaned = _parse_bare_calls(text, allowed)
+    if bare:
+        return bare, cleaned
     return [], text.strip()
 
 

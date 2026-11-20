@@ -99,15 +99,21 @@ function-call shape**:
 {"id":"call_1","type":"function","function":{"name":"FN","arguments":"{\"key\":\"value\"}"}}
 ```
 
-`arguments` is always a JSON **string**. Prose around the blocks survives;
-several blocks become several calls. The bridge extracts them and **removes the
-consumed spans from `content`**, so raw JSON never reaches the client.
+`arguments` is always a JSON **string** on the way out. Prose around the blocks
+survives; several blocks become several calls. The bridge extracts them and
+**removes the consumed spans from `content`**, so raw JSON never reaches the
+client.
 
-Extraction tries three patterns in order: tagged blocks, bare OpenAI-shaped
-JSON, then the legacy `{"tool_calls":[...]}` envelope. Requiring
-`id`/`type`/`function` in the bare-JSON pattern is what keeps a JSON-mode answer
-like `{"city":"Jakarta","temp":30}` from being eaten as a tool call. Names
-outside the caller's declared list are dropped.
+Extraction tries four patterns in order: tagged blocks, bare OpenAI-shaped JSON,
+the legacy `{"tool_calls":[...]}` envelope, then a bare `{"name":...,"arguments":...}`
+object (fenced, as an array, or inside prose). The last one exists because some
+agent CLIs — OpenCode among them — put their **own** tool format in the model's
+system prompt, which overrides this contract and comes back untagged.
+
+Requiring `id`/`type`/`function` in the bare-JSON pattern is what keeps a
+JSON-mode answer like `{"city":"Jakarta","temp":30}` from being eaten as a tool
+call; a bare `{name, arguments}` object is only accepted when the name matches a
+declared function. Names outside the caller's list are dropped.
 
 **The agent's own tools are never surfaced to a client that declared its own.**
 Prompt-level prohibition does not achieve this — the agent's internal system
