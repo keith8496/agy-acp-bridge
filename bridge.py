@@ -1132,7 +1132,7 @@ el.innerHTML=d.logins.map(l=>'<div style="margin:8px 0"><b>'+l.profile+'</b><div
 '<input id=c_'+l.id+' placeholder="paste code"><button onclick="fill(\''+l.id+'\')">submit</button></div>').join('')}
 async function fill(id){const code=document.getElementById('c_'+id).value.trim();
 const r=await j('/admin/login/complete',{loginId:id,code});alert(r.ok?('logged in: '+r.detail):('failed: '+r.detail));running();load()}
-async function test(name){const r=await j('/admin/test',{profile:name,model:'gemini-3.8-flash-medium'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
+async function test(name){const r=await j('/admin/test',{profile:name,model:'claude-sonnet-4-6'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
 load();running();setInterval(running,4000);
 </script></body></html>"""
 
@@ -1253,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/admin/test"):
             b = self._body()
             prof = b.get("profile") or "default"
-            model = b.get("model") or "gemini-3.8-flash-medium"
+            model = b.get("model") or "claude-sonnet-4-6"
             try:
                 ws = [w for w in POOL.ensure(prof) if w.alive()]
                 if not ws:
@@ -1297,7 +1297,9 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
-        model = raw_model or None
+        # agy's session default is a slow gemini tier; pin the fast model when
+        # callers omit `model`. Explicit model ids still pass through verbatim.
+        model = raw_model or "claude-sonnet-4-6"
         prof = prefer or "?"
         state = {}
         gen = None
