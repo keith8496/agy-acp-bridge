@@ -414,6 +414,8 @@ class AgyWorker:
         reused = False
         finished = False
         t_new = 0.0
+        first_chunk = 0.0
+        prompt_sent = 0.0
         prompt_text = text
         try:
             try:
@@ -466,6 +468,7 @@ class AgyWorker:
                 self.next_id += 1
                 self.id_q[mid] = q
                 blocks = [{"type": "text", "text": prompt_text}] + list(images or [])
+                prompt_sent = time.time()
                 self._send({"jsonrpc": "2.0", "id": mid, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": blocks}})
                 deadline = time.time() + timeout
@@ -515,6 +518,8 @@ class AgyWorker:
                         if u.get("sessionUpdate") == "agent_message_chunk":
                             c = u.get("content") or {}
                             if c.get("type") == "text" and c.get("text"):
+                                if not first_chunk:
+                                    first_chunk = time.time() - prompt_sent
                                 emitted = True
                                 yield c["text"]
                         continue
@@ -568,7 +573,8 @@ class AgyWorker:
                             self.sessions[(model or "", hashes)] = entry
                         log(f"[{self.profile}] turn cache="
                             f"{'hit' if reused else 'miss'} sent={len(prompt_text)}B "
-                            f"new={t_new * 1000:.0f}ms total={time.time() - t_start:.2f}s")
+                            f"new={t_new * 1000:.0f}ms first={first_chunk:.2f}s "
+                            f"total={time.time() - t_start:.2f}s")
                         if not emitted:
                             usable = [t for t in tools_out.values()
                                       if t["function"]["name"]]
