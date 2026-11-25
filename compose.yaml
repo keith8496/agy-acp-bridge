@@ -1,0 +1,22 @@
+services:
+  agy-bridge:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      AGY_ADMIN_TOKEN: "${AGY_ADMIN_TOKEN:?Set AGY_ADMIN_TOKEN in .env or the shell}"
+    ports:
+      - "127.0.0.1:20130:20130"
+    volumes:
+      - agy-profiles:/home/bridge/.gemini
+      - bridge-state:/var/lib/agy-bridge
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:20130/health', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  agy-profiles:
+  bridge-state:

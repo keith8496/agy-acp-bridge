@@ -19,6 +19,7 @@ Endpoints
 """
 import base64
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -29,6 +30,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import parse_qs, urlsplit
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -136,6 +138,13 @@ def list_profiles():
     return out
 
 
+def agy_env():
+    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb",
+           "HOME": os.environ.get("HOME", "/root")}
+    env.pop("AGY_ADMIN_TOKEN", None)
+    return env
+
+
 # ---------------------------------------------------------------- login flow
 class Login:
     def __init__(self, profile):
@@ -147,8 +156,7 @@ class Login:
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
-            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb",
-                 "HOME": os.environ.get("HOME", "/root")},
+            env=agy_env(),
         )
         self.url = None
         self.done = False
@@ -238,8 +246,7 @@ class AgyWorker:
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=WORKDIR, text=True, bufsize=1,
-            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb",
-                 "HOME": os.environ.get("HOME", "/root")},
+            env=agy_env(),
         )
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
@@ -620,7 +627,8 @@ class AgyWorker:
 
 
 # ---------------------------------------------------------------- pool
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile-state.json")
+STATE_FILE = os.environ.get("AGY_STATE_FILE", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "profile-state.json"))
 
 
 class ProfilePool:
@@ -1103,7 +1111,7 @@ def models_for(profile=None):
     hit = _model_cache.get(p)
     if hit and time.time() - hit["at"] < 300:
         return hit["models"]
-    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+    env = agy_env()
     tmp = None
     try:
         if p == "default":
@@ -1140,7 +1148,8 @@ def models_for(profile=None):
     return ms
 
 
-ADMIN_HTML = """<!doctype html><html><head><meta charset=utf-8><title>agy acp bridge</title>
+# Preserve JavaScript string escapes in inline event handlers.
+ADMIN_HTML = r"""<!doctype html><html><head><meta charset=utf-8><title>agy acp bridge</title>
 <style>body{font:14px/1.5 system-ui,#111;background:#0b0c10;color:#e8e8ea;margin:0;padding:28px}
 h1{font-size:18px;margin:0 0 18px}table{border-collapse:collapse;width:100%;margin-top:10px}
 td,th{border-bottom:1px solid #23252c;padding:8px;text-align:left;font-weight:400}th{color:#8b8f9a}
@@ -1156,14 +1165,17 @@ button{background:#2b6cff;border-color:#2b6cff;cursor:pointer}button:disabled{op
 <input id=prof placeholder="profile name, e.g. permainan10st"><button onclick=start()>start login</button>
 <div id=box></div>
 <script>
-const j=async(u,b)=>{const r=await fetch(u,{method:b?'POST':'GET',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});return r.json()};
+const token=new URLSearchParams(window.location.search).get('t');
+const j=async(u,b)=>{const url=new URL(u,window.location.origin);if(token!==null)url.searchParams.set('t',token);const r=await fetch(url,{method:b?'POST':'GET',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});return r.json()};
 async function load(){const d=await j('/admin/profiles');const tb=document.querySelector('#t tbody');tb.innerHTML='';
 for(const p of d.profiles){const tr=document.createElement('tr');
 tr.innerHTML='<td>'+(p.primary?'&#9733; ':'')+p.name+'</td><td class="'+(p.status==='ok'?'ok':(p.status==='tos'||p.status==='verify')?'bad':'muted')+'">'+p.status+'</td><td class=muted>'+(p.detail||'')+'</td><td><button onclick="test(\''+p.name+'\')">test turn</button> '+(p.primary?'':'<button onclick="primary(\''+p.name+'\')">make primary</button>')+'</td>';tb.appendChild(tr)}}
 async function primary(name){const r=await j('/admin/primary',{profile:name});alert(r.ok?('primary: '+r.primary):('failed: '+r.detail));load()}
-async function start(){const name=document.getElementById('prof').value.trim();if(!name)return;
-const d=await j('/admin/login/start',{profile:name});const box=document.getElementById('box');
-if(!d.ok){box.innerHTML='<div class=bad>'+d.error+'</div>';return}
+async function start(){const name=document.getElementById('prof').value.trim();const box=document.getElementById('box');
+if(!name){box.textContent='Enter a profile name first.';return}
+box.textContent='Starting login...';
+let d;try{d=await j('/admin/login/start',{profile:name})}catch{box.textContent='Could not reach the bridge login endpoint.';return}
+if(!d.loginId){box.textContent=d.error||'Could not start login';return}
 box.innerHTML='<div class=muted>open this, sign in, paste the code below</div><div class=url>'+(d.url||'waiting...')+'</div><input id=code placeholder="4/0A..."><button onclick="done(\''+d.loginId+'\')">submit code</button><div id=res></div>'}
 async function done(id){const code=document.getElementById('code').value.trim();
 const r=await j('/admin/login/complete',{loginId:id,code});document.getElementById('res').innerHTML='<span class="'+(r.ok?'ok':'bad')+'">'+(r.detail||'')+'</span>';load()}
@@ -1185,7 +1197,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _log_req(self):
-        log(f"{self.command} {self.path} from {self.client_address[0]} "
+        log(f"{self.command} {self.path.split('?', 1)[0]} from {self.client_address[0]} "
             f"ua={(self.headers.get('User-Agent') or '-')[:40]}")
 
     def _json(self, code, obj):
@@ -1207,7 +1219,11 @@ class Handler(BaseHTTPRequestHandler):
         tok = os.environ.get("AGY_ADMIN_TOKEN", "")
         if not tok:
             return True
-        return ("t=" + tok) in (self.path or "")
+        try:
+            tokens = parse_qs(urlsplit(self.path).query).get("t", [])
+        except ValueError:
+            return False
+        return len(tokens) == 1 and hmac.compare_digest(tokens[0].encode(), tok.encode())
 
     def _deny_admin(self):
         self._json(403, {"ok": False, "error": "admin token required"})
@@ -1481,8 +1497,8 @@ def prewarm():
 
 
 def main():
-    log(f"agy-acp-bridge v2 on 127.0.0.1:{PORT}, profiles={list_profiles()}")
     bind = os.environ.get("AGY_BRIDGE_BIND", "127.0.0.1")
+    log(f"agy-acp-bridge v2 on {bind}:{PORT}, profiles={list_profiles()}")
     srv = ThreadingHTTPServer((bind, PORT), Handler)
     srv.daemon_threads = True
     if PREWARM:
