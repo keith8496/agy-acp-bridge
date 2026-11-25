@@ -23,7 +23,9 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -64,6 +66,16 @@ SESSION_MAX = max(1, int(os.environ.get("AGY_SESSION_MAX", "4")))
 # Spawn the primary profile at boot instead of on the first request.
 PREWARM = os.environ.get("AGY_PREWARM", "1") != "0"
 PREWARM_PROFILES = max(0, int(os.environ.get("AGY_PREWARM_PROFILES", "1")))
+# Model used when the caller omits `model`. Override per deployment for
+# accounts whose catalog differs (e.g. newer Pro accounts expose Hydro tiers).
+MODEL_FALLBACKS = [
+    "claude-sonnet-4-6", "claude-opus-4-6-thinking",
+    "gemini-4-hydrogen", "gemini-4-hydrogen-low",
+    "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+]
+DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
 TOKEN_FILE = "antigravity-oauth-token"
 
 os.makedirs(WORKDIR, exist_ok=True)
@@ -442,10 +454,10 @@ class AgyWorker:
                     if not sid:
                         raise RuntimeError("no sessionId")
                     if model:
-                        try:
-                            self.rpc("session/set_model", {"sessionId": sid, "modelId": model}, 30)
-                        except Exception as e:
-                            log(f"[{self.profile}] set_model {model}: {e}")
+                        # A rejected model must fail the turn. Swallowing the
+                        # error answered HTTP 200 from agy's fallback model,
+                        # which silently lied about which model was used.
+                        self.rpc("session/set_model", {"sessionId": sid, "modelId": model}, 30)
                     if hashes is not None:
                         sess_key = (model or "", hashes)
                         # same history replayed (e.g. a retry or a fresh client
@@ -1070,19 +1082,33 @@ def flatten(messages):
     return body, images
 
 
-_model_cache = {"at": 0, "models": []}
+_model_cache = {}
 
 
 def models_for(profile=None):
-    if _model_cache["models"] and time.time() - _model_cache["at"] < 300:
-        return _model_cache["models"]
-    args = [AGY, "models"]
+    """List models for one account. `agy models` has no --app-data-dir flag
+    in 1.5.x, so point HOME at a shim whose .gemini/antigravity-cli is a link
+    to that profile's data dir. The old --app-data-dir call returned empty
+    for every named profile, making /v1/models look broken."""
     p = profile or (list_profiles() or ["default"])[0]
-    if p != "default":
-        args += ["--app-data-dir", profile_name(p)]
+    hit = _model_cache.get(p)
+    if hit and time.time() - hit["at"] < 300:
+        return hit["models"]
+    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+    tmp = None
     try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=40,
-                             env={**os.environ, "HOME": os.environ.get("HOME", "/root")})
+        if p == "default":
+            env["HOME"] = os.environ.get("HOME", "/root")
+        else:
+            tmp = tempfile.mkdtemp(prefix="agy-models-")
+            gem = os.path.join(tmp, ".gemini")
+            os.makedirs(gem)
+            target = (os.path.join(PROFILES_DIR, p[9:])
+                      if p.startswith("__legacy__") else profile_dir(p))
+            os.symlink(target, os.path.join(gem, "antigravity-cli"))
+            env["HOME"] = tmp
+        out = subprocess.run([AGY, "models"], capture_output=True, text=True,
+                             timeout=60, env=env)
         ms = []
         for line in (out.stdout or "").splitlines():
             line = line.strip()
@@ -1092,11 +1118,17 @@ def models_for(profile=None):
             if tok:
                 ms.append(tok)
         ms = list(dict.fromkeys(ms))
-        if ms:
-            _model_cache.update(at=time.time(), models=ms)
     except Exception as e:
-        log(f"models: {e}")
-    return _model_cache["models"]
+        log(f"models {p}: {e}")
+        ms = []
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if not ms:
+        # Never answer an empty list just because `agy models` changed its CLI.
+        ms = list(MODEL_FALLBACKS)
+    _model_cache[p] = {"at": time.time(), "models": ms}
+    return ms
 
 
 ADMIN_HTML = """<!doctype html><html><head><meta charset=utf-8><title>agy acp bridge</title>
@@ -1132,7 +1164,7 @@ el.innerHTML=d.logins.map(l=>'<div style="margin:8px 0"><b>'+l.profile+'</b><div
 '<input id=c_'+l.id+' placeholder="paste code"><button onclick="fill(\''+l.id+'\')">submit</button></div>').join('')}
 async function fill(id){const code=document.getElementById('c_'+id).value.trim();
 const r=await j('/admin/login/complete',{loginId:id,code});alert(r.ok?('logged in: '+r.detail):('failed: '+r.detail));running();load()}
-async function test(name){const r=await j('/admin/test',{profile:name,model:'claude-sonnet-4-6'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
+async function test(name){const r=await j('/admin/test',{profile:name,model:'__AGY_DEFAULT_MODEL__'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
 load();running();setInterval(running,4000);
 </script></body></html>"""
 
@@ -1197,7 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
                               "detail": st.get("detail", "")[:120]})
             return self._json(200, {"profiles": profs, "primary": prim})
         if self.path.startswith("/admin"):
-            b = ADMIN_HTML.encode()
+            b = ADMIN_HTML.replace("__AGY_DEFAULT_MODEL__", DEFAULT_MODEL).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
@@ -1253,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/admin/test"):
             b = self._body()
             prof = b.get("profile") or "default"
-            model = b.get("model") or "claude-sonnet-4-6"
+            model = b.get("model") or DEFAULT_MODEL
             try:
                 ws = [w for w in POOL.ensure(prof) if w.alive()]
                 if not ws:

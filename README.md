@@ -59,6 +59,8 @@ curl -s http://127.0.0.1:20130/v1/chat/completions \
        "messages":[{"role":"user","content":"hello"}]}'
 ```
 
+Omit `model` to use `AGY_DEFAULT_MODEL`. Accounts with Gemini 4 Hydrogen can
+request `gemini-4-hydrogen`, `-low`, `-medium`, `-high` or `-xhigh`.
 `"model": "<profile>/<model>"` pins an account. Responses carry `profile` and
 `fallback` so you can see which account served the turn.
 
@@ -187,7 +189,8 @@ an upstream anchor moved instead of half-applying.
 5. Don't add a second session check inside a 9router `/api/*` route —
    `dashboardGuard` already handles auth and the extra check 401s the dashboard.
 6. `session/set_model` is undocumented but implemented by `agy`. Call it and
-   tolerate failure rather than aborting the turn.
+   **fail the turn when it rejects the model** — swallowing the error answers
+   HTTP 200 from `agy`'s fallback model and lies about which model ran.
 7. `max_tokens` and `stop` are applied downstream: the model still generates in
    full, so they save output, not time.
 
@@ -196,7 +199,7 @@ an upstream anchor moved instead of half-applying.
 | method | path | purpose |
 |---|---|---|
 | GET | `/health` | liveness, workers, cache counters |
-| GET | `/v1/models` | models from the real CLI |
+| GET | `/v1/models` | models from the real CLI, per active profile (named profiles via a HOME shim, since `agy models` has no `--app-data-dir`) |
 | POST | `/v1/chat/completions` | stream + non-stream |
 | GET | `/admin?t=…` | account panel |
 | GET | `/admin/profiles` | profiles, status, primary |
@@ -211,6 +214,7 @@ an upstream anchor moved instead of half-applying.
 | var | default | meaning |
 |---|---|---|
 | `AGY_BIN` | `/root/.local/bin/agy` | CLI path |
+| `AGY_DEFAULT_MODEL` | `claude-sonnet-4-6` | model used when a request omits `model`; set this to an accepted slug on accounts whose catalog differs (Hydro tiers are `gemini-4-hydrogen-{low,medium,high,xhigh}`) |
 | `AGY_BRIDGE_PORT` | `20130` | listen port |
 | `AGY_BRIDGE_BIND` | `127.0.0.1` | `0.0.0.0` for a remote panel |
 | `AGY_ADMIN_TOKEN` | *(unset = open)* | required as `?t=…` on `/admin*` |

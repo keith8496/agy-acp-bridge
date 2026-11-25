@@ -33,5 +33,10 @@ export default {
     { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Thinking)" },
     { id: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 (Thinking)" },
     { id: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+    { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+    { id: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)" },
+    { id: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)" },
+    { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+    { id: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)" },
   ],
 };
