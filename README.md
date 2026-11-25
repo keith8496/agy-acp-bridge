@@ -59,9 +59,11 @@ curl -s http://127.0.0.1:20130/v1/chat/completions \
        "messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Omit `model` to use `AGY_DEFAULT_MODEL`. Accounts with Gemini 4 Hydrogen can
-request `gemini-4-hydrogen`, `-low`, `-medium`, `-high` or `-xhigh`.
-`"model": "<profile>/<model>"` pins an account. Responses carry `profile` and
+Omit `model` to use `AGY_DEFAULT_MODEL`. The provider card also registers
+Gemini 4 Hydrogen / Carbon / Argon / Neon and Claude Sonnet / Opus 5.5 tiers;
+catalogs differ per account, so an unoffered id returns a clear
+`session/set_model: Unknown model ID` error instead of silently using another
+model. `"model": "<profile>/<model>"` pins an account. Responses carry `profile` and
 `fallback` so you can see which account served the turn.
 
 ## Accounts

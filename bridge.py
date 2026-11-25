@@ -70,10 +70,19 @@ PREWARM_PROFILES = max(0, int(os.environ.get("AGY_PREWARM_PROFILES", "1")))
 # accounts whose catalog differs (e.g. newer Pro accounts expose Hydro tiers).
 MODEL_FALLBACKS = [
     "claude-sonnet-4-6", "claude-opus-4-6-thinking",
-    "gemini-4-hydrogen", "gemini-4-hydrogen-low",
-    "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high",
-    "gemini-4-hydrogen-xhigh",
     "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+]
+# Registered ids from the provider card. Some accounts do not offer every
+# family; a rejected id fails the turn instead of silently changing model.
+MODEL_FALLBACKS += [
+    f"gemini-4-{fam}{tier}"
+    for fam in ("hydrogen", "carbon", "argon", "neon")
+    for tier in ("", "-low", "-medium", "-high", "-xhigh")
+    if not (fam in ("carbon", "argon") and tier == "-xhigh")
+] + [
+    f"claude-{fam}-5-5{tier}"
+    for fam in ("sonnet", "opus")
+    for tier in ("", "-low", "-medium", "-high", "-max")
 ]
 DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
 TOKEN_FILE = "antigravity-oauth-token"
