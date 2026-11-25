@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!bridge.py
+!hooks/
+!hooks/hooks.json
+!hooks/deny_builtin.py

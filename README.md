@@ -13,6 +13,41 @@ client ──HTTP──> bridge :20130 ──ACP/stdio──> agy acp ──> Go
 Stdlib only, no pip installs. Multi-account with primary + fallback, real tool
 calling, live session reuse.
 
+## Docker (Compose)
+
+Create a local `.env` with `AGY_ADMIN_TOKEN` set to a long, random, URL-safe
+value; restrict access to the file. Then run:
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:20130/health
+```
+
+The port is published on the Docker host's loopback. Use Docker Engine 28+ for
+loopback publishing; older releases can allow access from the same L2 network.
+For remote admin,
+forward it over SSH (e.g. `ssh -N -L 20130:127.0.0.1:20130 <docker-host>`).
+Open `http://127.0.0.1:20130/admin?t=<AGY_ADMIN_TOKEN>` and follow the account
+login instructions below. `/v1/*` has no bridge authentication; do not publish
+it to an untrusted network. For 9router in a separate container, connect both
+services to a shared network and set `AGY_BRIDGE_URL=http://agy-bridge:20130`
+for the admin proxy. Also change the provider's inference URL in
+`9r-patch/antigravity-acp.js` to
+`http://agy-bridge:20130/v1/chat/completions` before rebuilding 9router.
+
+Compose retains CLI credentials in `agy-profiles` and routing state in
+`bridge-state`. Treat the credentials volume as sensitive; `docker compose down -v`
+removes both volumes. The official installer selects the upstream release at
+build time; use `docker compose build --no-cache` to refresh it deliberately.
+
+`/health` checks HTTP liveness, not account readiness. After login, test a real
+completion with an explicit model available to your account, then check streaming,
+hook behavior (`/home/bridge/work/hooks.log`), and volume persistence across
+`docker compose up -d --force-recreate`. Keep Docker's default security profile.
+Google documents that `--sandbox` can be ineffective on hosts that block
+unprivileged user namespaces: a successful turn alone does not prove isolation.
+
 ## Install
 
 **1. CLI**

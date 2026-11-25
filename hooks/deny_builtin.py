@@ -14,7 +14,8 @@ import os
 import sys
 import time
 
-MODE_DIR = "/root/agy-bridge/work/.bridge-mode"
+WORKDIR = os.environ.get("AGY_CWD") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODE_DIR = os.path.join(WORKDIR, ".bridge-mode")
 REASON = ("Built-in tools are disabled for this request. Do not call them. "
           "Fulfil the request by emitting the caller's function as a "
           "tool_call block in OpenAI function-call shape (arguments as a JSON "
@@ -29,7 +30,7 @@ conv = str(payload.get("conversationId") or "")
 conditional = os.path.isfile(os.path.join(MODE_DIR, conv + ".json"))
 decision = "deny" if conditional else "allow"
 try:
-    with open("/var/log/agy-bridge-hooks.log", "a") as fh:
+    with open(os.environ.get("AGY_HOOK_LOG", "/var/log/agy-bridge-hooks.log"), "a") as fh:
         fh.write(f"{time.strftime('%H:%M:%S')} {decision} {name} conv={conv[:8]}\n")
 except Exception:
     pass
